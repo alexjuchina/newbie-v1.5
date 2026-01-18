@@ -1,0 +1,4193 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ full_version }}</title>
+    <link rel="stylesheet" href="/static/style.css" />
+    <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+    <script>
+      // 多模型对比功能
+      document.addEventListener('DOMContentLoaded', () => {
+        const multiInput = document.getElementById('multi_input');
+        const multiSubmit = document.getElementById('multi_submit');
+        const multiSystemPrompt = document.getElementById('multi_system_prompt');
+        const multiModelSelect = document.getElementById('multi_model_select');
+        const multiResults = document.getElementById('multi_results');
+        const multiDisplayMode = document.getElementById('multi_display_mode');
+        
+        // 维护每个模型的累积内容，避免重复渲染
+        const modelContentCache = new Map();
+
+
+        // 显示模式切换
+        multiDisplayMode.addEventListener('change', () => {
+          const mode = multiDisplayMode.value;
+          multiResults.className = `multi-results-container ${mode}`;
+        });
+
+        // 提交按钮
+        multiSubmit.addEventListener('click', async () => {
+          const input = multiInput.value.trim();
+          if (!input) {
+            alert('请输入问题');
+            return;
+          }
+
+          // 收集LLM&VLM模型选择
+          const llmModels = Array.from(multiModelSelect.querySelectorAll('input[type="checkbox"]:checked'))
+            .map(checkbox => checkbox.value);
+          
+          // 收集生图模型选择
+          const imgModels = Array.from(document.getElementById('multi_img_model_select').querySelectorAll('input[type="checkbox"]:checked'))
+            .map(checkbox => checkbox.value);
+          
+          // 合并所有选中的模型
+          const selectedModels = [...llmModels, ...imgModels];
+
+          if (selectedModels.length === 0) {
+            alert('请选择至少一个模型');
+            return;
+          }
+
+          // 清空结果和缓存
+          multiResults.innerHTML = '';
+          modelContentCache.clear();
+
+          // 创建结果卡片
+          selectedModels.forEach(model => {
+            const card = document.createElement('div');
+            card.className = 'model-result-card';
+            card.dataset.model = model;
+            
+            // 美化模型名称显示
+            let displayName = model;
+            if (model.startsWith('pic_')) {
+              // Seedream模型：去掉前缀并添加中文标识
+              displayName = `Seedream: ${model.replace('pic_', '')}`;
+            } else if (model === 'jimeng_ai') {
+              // 即梦AI模型：使用中文名称
+              displayName = '即梦AI';
+            }
+            
+            card.innerHTML = `
+              <div class="model-header">
+                <div class="model-name">${displayName}</div>
+                <div class="model-actions">
+                  <button class="regenerate-btn">重新生成</button>
+                </div>
+              </div>
+              <div class="md-content model-content streaming">正在生成...</div>
+              <div class="model-footer">
+                <div class="stats">耗时: 0s | Tokens: 0</div>
+                <div class="request-id"></div>
+              </div>
+            `;
+            
+            multiResults.appendChild(card);
+          });
+
+          // 发送请求
+          try {
+            const systemPrompt = multiSystemPrompt.value.trim();
+            
+            // 分离LLM模型和生图模型
+            const llmModels = selectedModels.filter(model => !model.startsWith('pic_') && model !== 'jimeng_ai');
+            const imgModels = selectedModels.filter(model => model.startsWith('pic_') || model === 'jimeng_ai');
+            
+            // 处理LLM模型请求
+            if (llmModels.length > 0) {
+              console.log('[DEBUG] 发送LLM模型对比请求:', { input: input, models: llmModels, systemPrompt: systemPrompt });
+              
+              const response = await fetch('/api/multi_model_chat', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                  input: input,
+                  models: llmModels,
+                  system_prompt: systemPrompt || null
+                })
+              });
+
+              console.log('[DEBUG] LLM响应状态:', response.status, response.statusText);
+              
+              if (!response.ok) {
+                throw new Error('LLM请求失败');
+              }
+
+              // 检查响应类型
+              const contentType = response.headers.get('content-type');
+              console.log('[DEBUG] LLM响应类型:', contentType);
+              
+              if (contentType && contentType.includes('text/plain')) {
+                // 流式响应处理
+                console.log('[DEBUG] 开始处理LLM流式响应');
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder('utf-8');
+                let buffer = '';
+
+                while (true) {
+                  const { done, value } = await reader.read();
+                  console.log('[DEBUG] 读取LLM流数据:', done, value ? value.length : 0);
+                  
+                  if (done) {
+                    console.log('[DEBUG] LLM流式响应结束');
+                    break;
+                  }
+
+                  const chunk = decoder.decode(value, { stream: true });
+                  console.log('[DEBUG] 解码LLM数据:', chunk.length, '字符');
+                  buffer += chunk;
+                  
+                  // 按行分割处理
+                  const lines = buffer.split('\n');
+                  buffer = lines.pop() || ''; // 保留未完成的最后一行
+                  
+                  lines.forEach(line => {
+                    line = line.trim();
+                    if (line.startsWith('data: ')) {
+                      try {
+                        const dataStr = line.slice(6);
+                        if (dataStr.trim() === '') return; // 跳过空数据
+                        const data = JSON.parse(dataStr);
+                        console.log('[DEBUG] 解析到LLM数据:', data.event, data.model_id, data.content ? data.content.length : 0);
+                        handleMultiModelResponse(data);
+                      } catch (e) {
+                        console.error('LLM解析错误:', e, '数据:', line);
+                      }
+                    }
+                  });
+                }
+              }
+            }
+            
+            // 处理生图模型请求
+            if (imgModels.length > 0) {
+              console.log('[DEBUG] 发送生图模型对比请求:', { input: input, models: imgModels });
+              
+              // 并行发送所有生图模型请求
+              const imagePromises = imgModels.map(async (model) => {
+                try {
+                  let endpoint = '';
+                  let requestBody = { input: input };
+                  
+                  if (model.startsWith('pic_')) {
+                    // Seedream图片生成
+                    endpoint = '/api/picture_generate';
+                    requestBody.model = model.replace('pic_', '');
+                    requestBody.size = '4K'; // 使用默认尺寸
+                    requestBody.response_format = 'url';
+                    requestBody.watermark = false;
+                  } else if (model === 'jimeng_ai') {
+                    // 即梦AI图片生成
+                    endpoint = '/api/jimeng_ai_generate';
+                    requestBody.run_count = 1;
+                    const widthRaw = document.getElementById('jimeng_width')?.value;
+                    const heightRaw = document.getElementById('jimeng_height')?.value;
+                    const width = widthRaw ? parseInt(widthRaw, 10) : null;
+                    const height = heightRaw ? parseInt(heightRaw, 10) : null;
+                    if (width !== null || height !== null) {
+                      if (width === null || height === null) {
+                        throw new Error('自定义尺寸需同时填写宽和高');
+                      }
+                      if (Number.isNaN(width) || Number.isNaN(height)) {
+                        throw new Error('自定义宽高必须为整数');
+                      }
+                      if (width < 1024 || width > 4096 || height < 1024 || height > 4096) {
+                        throw new Error('自定义宽高范围：1024~4096');
+                      }
+                      const area = width * height;
+                      if (area < 1048576 || area > 16777216) {
+                        throw new Error('宽高乘积需在 1024×1024~4096×4096');
+                      }
+                      requestBody.width = width;
+                      requestBody.height = height;
+                    }
+                  }
+                  
+                  const response = await fetch(endpoint, {
+                    method: 'POST',
+                    headers: {
+                      'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(requestBody)
+                  });
+                  
+                  const data = await response.json();
+                  console.log('[DEBUG] 生图模型响应:', model, data);
+                  
+                  if (response.ok && data) {
+                    // 处理生图模型响应
+                    handleImageModelResponse(model, data);
+                  } else {
+                    throw new Error(data.error || '生图请求失败');
+                  }
+                } catch (error) {
+                  console.error('生图模型请求错误:', model, error);
+                  // 更新UI显示错误
+                  const card = document.querySelector(`.model-result-card[data-model="${model}"]`);
+                  if (card) {
+                    const content = card.querySelector('.model-content');
+                    const status = card.querySelector('.status');
+                    content.innerHTML = markdownToHtml('错误: ' + error.message);
+                    content.classList.remove('streaming');
+                    if (status) {
+                      status.textContent = '错误';
+                    }
+                  }
+                }
+              });
+              
+              // 等待所有生图请求完成
+              await Promise.all(imagePromises);
+            }
+            
+          } catch (error) {
+            console.error('请求错误:', error);
+            alert('请求失败: ' + error.message);
+          }
+        });
+
+        function handleMultiModelResponse(data) {
+          if (data.event === 'content_delta') {
+            const card = document.querySelector(`.model-result-card[data-model="${data.model_id}"]`);
+            if (card) {
+              const content = card.querySelector('.model-content');
+              const status = card.querySelector('.status');
+              const stats = card.querySelector('.stats');
+
+              // 检查内容是否真的有变化，避免重复渲染
+              const prevContent = modelContentCache.get(data.model_id) || '';
+              const currentContent = data.content || '';
+              
+              if (currentContent !== prevContent) {
+                // 只有内容变化时才更新 DOM
+                content.innerHTML = markdownToHtml(currentContent);
+                modelContentCache.set(data.model_id, currentContent);
+              }
+              
+              if (status) {
+                status.textContent = '生成中';
+              }
+              stats.textContent = `Tokens: ${currentContent.length}`;
+            }
+          } else if (data.event === 'final') {
+            const card = document.querySelector(`.model-result-card[data-model="${data.model_id}"]`);
+            if (card) {
+              const content = card.querySelector('.model-content');
+              const status = card.querySelector('.status');
+              const stats = card.querySelector('.stats');
+
+              const currentContent = data.content || '';
+              content.innerHTML = markdownToHtml(currentContent);
+              content.classList.remove('streaming');
+              // 清理缓存
+              modelContentCache.delete(data.model_id);
+              
+              if (status) {
+                status.textContent = '完成';
+              }
+              stats.textContent = `耗时 ${(data.total_time || 0).toFixed(2)}s | Tokens: ${currentContent.length}`;
+            }
+          } else if (data.event === 'error') {
+            const card = document.querySelector(`.model-result-card[data-model="${data.model_id}"]`);
+            if (card) {
+              const content = card.querySelector('.model-content');
+              const status = card.querySelector('.status');
+
+              content.innerHTML = markdownToHtml('错误: ' + data.message);
+              content.classList.remove('streaming');
+              // 清理缓存
+              modelContentCache.delete(data.model_id);
+              
+              if (status) {
+                status.textContent = '错误';
+              }
+            }
+          }
+        }
+
+        // 处理生图模型响应
+        function handleImageModelResponse(modelId, data) {
+          const card = document.querySelector(`.model-result-card[data-model="${modelId}"]`);
+          if (!card) {
+            console.error('找不到对应的卡片:', modelId);
+            return;
+          }
+          
+          const content = card.querySelector('.model-content');
+          const status = card.querySelector('.status');
+          const stats = card.querySelector('.stats');
+          const requestIdEl = card.querySelector('.request-id');
+          
+          let imagesHtml = '';
+          let modelName = modelId;
+          let generationTime = 0;
+          let requestId = '';
+          
+          // 处理Seedream模型响应
+          if (modelId.startsWith('pic_')) {
+            if (data.results && Array.isArray(data.results)) {
+              // 并发结果格式
+              const result = data.results[0];
+              if (result.data && result.data.length > 0) {
+                imagesHtml = generateImagesHtml(result.data);
+                modelName = result.model || modelName;
+                generationTime = result.generation_time || 0;
+                requestId = result.request_id || result.id || '';
+              }
+            } else if (data.data && Array.isArray(data.data)) {
+              // 单个结果格式
+              imagesHtml = generateImagesHtml(data.data);
+              modelName = data.model || modelName;
+              generationTime = data.generation_time || 0;
+              requestId = data.request_id || data.id || '';
+            }
+          }
+          // 处理即梦AI模型响应
+          else if (modelId === 'jimeng_ai') {
+            if (data.results && Array.isArray(data.results)) {
+              const result = data.results[0];
+              if (result.image_urls && result.image_urls.length > 0) {
+                imagesHtml = generateImagesHtmlFromJimeng(result.image_urls);
+              } else if (result.binary_data_base64 && result.binary_data_base64.length > 0) {
+                imagesHtml = generateImagesHtmlFromBase64(result.binary_data_base64);
+              }
+              modelName = '即梦AI';
+              // 优先显示request_id，这是任务完成后的最终请求ID
+              requestId = result.request_id || result.task_id || result.id || '';
+              // 获取耗时信息，尝试多种可能的字段名
+              generationTime = result.total_time || result.generation_time || result.time || result.duration || 0;
+            }
+          }
+          
+          // 更新卡片内容
+          content.innerHTML = imagesHtml;
+          content.classList.remove('streaming');
+          if (stats) {
+            stats.textContent = `耗时 ${generationTime.toFixed(2)}s`;
+          }
+          
+          // 显示请求ID
+          if (requestIdEl) {
+            if (requestId) {
+              requestIdEl.textContent = `ID: ${requestId}`;
+            } else {
+              requestIdEl.textContent = '';
+            }
+          }
+        }
+        
+        // 生成Seedream图片HTML
+        function generateImagesHtml(images) {
+          let html = '';
+          images.forEach((image, index) => {
+            if (image.url) {
+              html += `<div style="margin-bottom: 10px;">
+                        <img src="${image.url}" alt="生成的图片 ${index + 1}" style="max-width: 100%; max-height: 400px; cursor: pointer;" onclick="openModal('${image.url}')">
+                      </div>`;
+            } else if (image.b64_json) {
+              const dataUrl = `data:image/png;base64,${image.b64_json}`;
+              html += `<div style="margin-bottom: 10px;">
+                        <img src="${dataUrl}" alt="生成的图片 ${index + 1}" style="max-width: 100%; max-height: 400px; cursor: pointer;" onclick="openModal('${dataUrl}')">
+                      </div>`;
+            }
+          });
+          return html;
+        }
+        
+        // 生成即梦AI图片HTML（从URL）
+        function generateImagesHtmlFromJimeng(imageUrls) {
+          let html = '';
+          imageUrls.forEach((url, index) => {
+            html += `<div style="margin-bottom: 10px;">
+                      <img src="${url}" alt="生成的图片 ${index + 1}" style="max-width: 100%; max-height: 400px; cursor: pointer;" onclick="openModal('${url}')">
+                    </div>`;
+          });
+          return html;
+        }
+        
+        // 生成即梦AI图片HTML（从Base64）
+        function generateImagesHtmlFromBase64(base64Array) {
+          let html = '';
+          base64Array.forEach((base64, index) => {
+            const dataUrl = `data:image/jpeg;base64,${base64}`;
+            html += `<div style="margin-bottom: 10px;">
+                      <img src="${dataUrl}" alt="生成的图片 ${index + 1}" style="max-width: 100%; max-height: 400px; cursor: pointer;" onclick="openModal('${dataUrl}')">
+                    </div>`;
+          });
+          return html;
+        }
+
+        // 重新生成按钮事件委托
+        multiResults.addEventListener('click', (e) => {
+          if (e.target.classList.contains('regenerate-btn')) {
+            const card = e.target.closest('.model-result-card');
+            const modelId = card.dataset.model;
+            const input = multiInput.value.trim();
+            
+            if (!input) {
+              alert('请输入问题');
+              return;
+            }
+
+            const content = card.querySelector('.model-content');
+            const status = card.querySelector('.status');
+            const stats = card.querySelector('.stats');
+
+            content.textContent = '正在重新生成...';
+            content.classList.add('streaming');
+            if (status) {
+              status.textContent = '生成中';
+            }
+            stats.textContent = '耗时 0s';
+
+            // 判断模型类型并发送相应请求
+            if (modelId.startsWith('pic_') || modelId === 'jimeng_ai') {
+              // 生图模型重新生成
+              try {
+                let endpoint = '';
+                let requestBody = { input: input };
+                
+                if (modelId.startsWith('pic_')) {
+                  // Seedream图片生成
+                  endpoint = '/api/picture_generate';
+                  requestBody.model = modelId.replace('pic_', '');
+                  requestBody.size = '4K'; // 使用默认尺寸
+                  requestBody.response_format = 'url';
+                  requestBody.watermark = false;
+                } else if (modelId === 'jimeng_ai') {
+                  // 即梦AI图片生成
+                  endpoint = '/api/jimeng_ai_generate';
+                  requestBody.run_count = 1;
+                  const widthRaw = document.getElementById('jimeng_width')?.value;
+                  const heightRaw = document.getElementById('jimeng_height')?.value;
+                  const width = widthRaw ? parseInt(widthRaw, 10) : null;
+                  const height = heightRaw ? parseInt(heightRaw, 10) : null;
+                  if (width !== null || height !== null) {
+                    if (width === null || height === null) {
+                      throw new Error('自定义尺寸需同时填写宽和高');
+                    }
+                    if (Number.isNaN(width) || Number.isNaN(height)) {
+                      throw new Error('自定义宽高必须为整数');
+                    }
+                    if (width < 1024 || width > 4096 || height < 1024 || height > 4096) {
+                      throw new Error('自定义宽高范围：1024~4096');
+                    }
+                    const area = width * height;
+                    if (area < 1048576 || area > 16777216) {
+                      throw new Error('宽高乘积需在 1024×1024~4096×4096');
+                    }
+                    requestBody.width = width;
+                    requestBody.height = height;
+                  } else {
+                    // 获取预设尺寸
+                    const sizeElement = document.getElementById('jimeng_size');
+                    if (sizeElement) {
+                      requestBody.size = parseInt(sizeElement.value || '4194304', 10);
+                    }
+                  }
+                }
+                
+                fetch(endpoint, {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                  },
+                  body: JSON.stringify(requestBody)
+                }).then(response => {
+                  if (!response.ok) throw new Error('请求失败');
+                  return response.json();
+                }).then(data => {
+                  // 处理生图模型响应
+                  handleImageModelResponse(modelId, data);
+                }).catch(error => {
+                  console.error('生图模型重新生成失败:', modelId, error);
+                  content.innerHTML = markdownToHtml('错误: ' + error.message);
+                  content.classList.remove('streaming');
+                  status.textContent = '错误';
+                });
+              } catch (error) {
+                console.error('生图模型重新生成失败:', modelId, error);
+                content.innerHTML = markdownToHtml('错误: ' + error.message);
+                content.classList.remove('streaming');
+                status.textContent = '错误';
+              }
+            } else {
+              // LLM模型重新生成
+              const systemPrompt = multiSystemPrompt.value.trim();
+              fetch('/api/multi_model_chat', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                  input: input,
+                  models: [modelId],
+                  system_prompt: systemPrompt || null
+                })
+              }).then(response => {
+                if (!response.ok) throw new Error('请求失败');
+                return response.body.getReader();
+              }).then(reader => {
+                const decoder = new TextDecoder('utf-8');
+                return reader.read().then(function processResult({ done, value }) {
+                  if (done) return;
+
+                  const chunk = decoder.decode(value);
+                  const lines = chunk.split('\n');
+
+                  lines.forEach(line => {
+                    if (line.startsWith('data: ')) {
+                      try {
+                        const data = JSON.parse(line.slice(6));
+                        handleMultiModelResponse(data);
+                      } catch (e) {
+                        console.error('解析错误:', e);
+                      }
+                    }
+                  });
+
+                  return reader.read().then(processResult);
+                });
+              }).catch(error => {
+                console.error('重新生成失败:', error);
+                content.textContent = '重新生成失败: ' + error.message;
+                content.classList.remove('streaming');
+                if (status) {
+                  status.textContent = '错误';
+                }
+              });
+            }
+          }
+        });
+      });
+    </script>
+
+  </head>
+  <body>
+    <!-- 粒子背景画布 -->
+    <canvas id="particle-canvas"></canvas>
+    
+    <!-- 顶部导航栏 -->
+    <div class="top-nav">
+      <div class="nav-container">
+        <div class="nav-title">{{ full_version }}</div>
+        <nav class="tabs">
+          <button class="tab-btn active" data-tab="tab-ep">EP模型推理</button>
+          <button class="tab-btn" data-tab="tab-pic">Seedream图片生成</button>
+          <button class="tab-btn" data-tab="tab-video">Seedance视频生成</button>
+          <button class="tab-btn" data-tab="tab-jimeng">即梦AI</button>
+          <button class="tab-btn" data-tab="tab-nq">联网问答Agent</button>
+          <button class="tab-btn" data-tab="tab-multi-model">多模型对比</button>
+        </nav>
+      </div>
+    </div>
+    
+    <div class="container">
+
+      <section id="tab-ep" class="tab-panel active">
+        <div class="form">
+
+          <label>输入</label>
+          <textarea id="ep_input" rows="4" placeholder="请输入文本或粘贴图片"></textarea>
+
+          <label>模型类型</label>
+          <select id="ep_model">
+            {% for model_id, label in ep_models_map.items() %}
+              <option value="{{ model_id }}" {% if model_id == default_ep_model %}selected{% endif %}>{{ label }}</option>
+            {% endfor %}
+          </select>
+
+          <label>System Prompt（可选）</label>
+          <textarea id="ep_system_prompt" rows="4" placeholder="使用默认SP"></textarea>
+
+          <label>运行次数</label>
+          <input id="ep_run_count" type="number" min="1" value="1" />
+
+          <div style="display: flex; gap: 24px; align-items: center;">
+            <div style="display: flex; align-items: center; gap: 6px; white-space: nowrap;">
+              <input type="checkbox" id="ep_thinking_mode" {% if default_thinking == 'enabled' %}checked{% endif %} style="width: 16px; height: 16px;" />
+              <label for="ep_thinking_mode" style="width: auto; margin: 0;">Thinking</label>
+            </div>
+            <div style="display: flex; align-items: center; gap: 6px; white-space: nowrap;">
+              <label style="width: 100px; text-align: right;">Temperature</label>
+              <input id="ep_temperature" type="number" step="0.001" min="0" max="2" value="{{ default_temperature }}" placeholder="{{ default_temperature }}" required style="width: 50px;" />
+              <span style="color: #666; font-size: 11px;">0~2</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 6px; white-space: nowrap;">
+              <label style="width: 70px; text-align: right;">Top P</label> 
+              <input id="ep_top_p" type="number" step="0.01" min="0" max="1" value="{{ default_top_p }}" placeholder="{{ default_top_p }}" required style="width: 50px;" />
+              <span style="color: #666; font-size: 11px;">0~1</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 6px; white-space: nowrap;">
+              <label style="width: 100px; text-align: right;">Max Tokens</label>
+              <input id="ep_max_tokens" type="number" min="1" max="32768" value="{{ default_max_tokens }}" placeholder="{{ default_max_tokens }}" required style="width: 50px;" />
+              <span style="color: #666; font-size: 11px;">1~32768</span>
+            </div>
+          </div>
+
+          <div id="ep_reasoning_container" style="display: none;">
+            <label id="ep_reasoning_label">Reasoning Effort</label>
+            <select id="ep_reasoning_effort">
+              <option value="minimal">minimal</option>
+              <option value="low">low</option>
+              <option value="medium" selected>medium</option>
+              <option value="high">high</option>
+            </select>
+          </div>
+
+          <label>图片理解(可选)</label>
+          <input id="ep_image" type="file" accept="image/*" />
+
+          <label>批量问题导入(可选，支持xlsx/csv)</label>
+          <input id="ep_batch_file" type="file" accept=".xlsx,.csv" />
+
+          <!-- 问题清单显示容器 -->
+          <div id="ep_question_list" class="question-list-container"></div>
+
+          <button id="ep_submit">运行</button>
+          
+          <div id="ep_export_container" style="display:none; margin-top: 10px;">
+            <button id="ep_download_results" style="width: 100%;">下载结果</button>
+          </div>
+        </div>
+        <div id="ep_results" class="result-list"></div>
+        <div id="toast-container" class="toast-container"></div>
+        <pre id="ep_output" class="output" style="display:none;"></pre>
+      </section>
+
+      <section id="tab-nq" class="tab-panel">
+        <div class="form">
+
+          <label>输入</label>
+          <textarea id="nq_input" rows="4" placeholder="请输入问题"></textarea>
+
+          <label>批量问题导入(可选，支持xlsx/csv)</label>
+          <input type="file" id="nq_batch_file" accept=".xlsx,.csv" />
+          <div id="nq_question_list" class="question-list-container"></div>
+
+          <label>System Prompt（可选）</label>
+          <textarea id="nq_system_prompt" rows="4" placeholder="使用默认SP"></textarea>
+
+          <label>Thinking</label>
+          <select id="nq_thinking">
+            <option value="">默认</option>
+            <option value="thinking">深度思考</option>
+            <option value="auto_thinking">自动深度思考</option>
+          </select>
+
+          <label>运行次数</label>
+          <input id="nq_run_count" type="number" min="1" value="1" />
+
+          <button id="nq_submit">提交 联网问答</button>
+          
+          <div id="nq_export_container" style="display:none; margin-top: 10px; padding: 10px; background: #0b1220; border: 1px solid #1f2937; border-radius: 6px;">
+            <button id="nq_download_results">下载结果（CSV）</button>
+          </div>
+        </div>
+        <div id="nq_results" class="result-list"></div>
+        <pre id="nq_output" class="output" style="display:none;"></pre>
+      </section>
+
+      <section id="tab-pic" class="tab-panel">
+        <div class="form">
+
+          <label>生图模式</label>
+          <select id="pic_input_mode">
+            <option value="text_to_image">文生图</option>
+            <option value="image_to_image">图生图</option>
+          </select>
+
+          <label>输入</label>
+          <textarea id="pic_input" rows="4" placeholder="请输入文本或粘贴图片"></textarea>
+
+          <div id="pic_reference_upload_container" style="display: none;">
+            <label>参考图</label>
+            <input type="file" id="pic_reference_image" accept="image/*" multiple />
+            <div id="pic_preview_container" style="margin-top: 10px;"></div>
+          </div>
+
+          <label>模型</label>
+          <select id="pic_model">
+            {% for label, model_id in pic_models_map.items() %}
+              <option value="{{ model_id }}" {% if model_id == default_pic_model %}selected{% endif %}>{{ label }}</option>
+            {% endfor %}
+          </select>
+
+          <label>尺寸</label>
+          <select id="pic_size">
+            {% for label, size_val in pic_sizes_map.items() %}
+              {% if size_val != 'custom' %}
+                <option value="{{ label }}" {% if label == default_pic_size %}selected{% endif %}>{{ label }}</option>
+              {% endif %}
+            {% endfor %}
+          </select>
+
+          <div id="pic_optimize_mode_container">
+            <label>优化模式</label>
+            <select id="pic_optimize_mode">
+              <option value="standard">标准模式</option>
+              <option value="fast">快速模式</option>
+            </select>
+          </div>
+
+          <label>返回格式</label>
+          <select id="pic_response_format">
+            <option value="url">URL</option>
+            <option value="b64_json">Base64</option>
+          </select>
+
+          <label>水印</label>
+          <select id="pic_watermark">
+            <option value="false">无水印</option>
+            <option value="true">添加水印</option>
+          </select>
+
+          <label>运行次数</label>
+          <input id="pic_run_count" type="number" min="1" max="10" value="1" />
+
+          <label>批量问题导入(可选，支持xlsx/csv)</label>
+          <input id="pic_batch_file" type="file" accept=".xlsx,.csv" />
+
+          <!-- 问题清单显示容器 -->
+          <div id="pic_question_list" class="question-list-container"></div>
+
+          <button id="pic_submit">提交 图片生成</button>
+          <button id="pic_download_results" style="display:none;">下载结果</button>
+        </div>
+        <pre id="pic_output" class="output"></pre>
+      </section>
+
+      <section id="tab-multi-model" class="tab-panel">
+        <div class="form">
+          
+          <label>输入</label>
+          <textarea id="multi_input" rows="6" placeholder="请输入文本"></textarea>
+          
+          <label>System Prompt（可选）</label>
+          <textarea id="multi_system_prompt" rows="4" placeholder="使用默认SP"></textarea>
+          
+          <label>模型选择(LLM&VLM)</label>
+          <div class="model-list" id="multi_model_select">
+            {% for model_id, label in ep_models_map.items() %}
+              <div class="model-item">
+                <input type="checkbox" id="model_{{ model_id }}" value="{{ model_id }}">
+                <label for="model_{{ model_id }}">{{ label }}</label>
+              </div>
+            {% endfor %}
+          </div>
+
+          <label>模型选择(生图)</label>
+          <div class="model-list" id="multi_img_model_select">
+            {% for model_id, label in pic_models_map.items() %}
+              <div class="model-item">
+                <input type="checkbox" id="img_model_{{ model_id }}" value="pic_{{ model_id }}">
+                <label for="img_model_{{ model_id }}">Seedream: {{ label }}</label>
+              </div>
+            {% endfor %}
+              <div class="model-item">
+                <input type="checkbox" id="img_model_jimeng" value="jimeng_ai">
+                <label for="img_model_jimeng">即梦AI</label>
+              </div>
+          </div>
+
+          <label>显示模式</label>
+          <select id="multi_display_mode">
+            <option value="grid">网格布局</option>
+            <option value="vertical">纵向布局</option>
+          </select>
+
+          <div class="button-group">
+            <button id="multi_submit">开始对比</button>
+          </div>
+
+        </div>
+
+        <div id="multi_results" class="multi-results-container"></div>
+      </section>
+
+      <!-- 即梦AI标签面板 -->
+      <section id="tab-jimeng" class="tab-panel">
+        <div class="form">
+          <label>输入</label>
+          <textarea id="jimeng_input" rows="4" placeholder="请输入文本描述，例如：生成一只金毛狗狗"></textarea>
+
+          <label>运行次数</label>
+          <input id="jimeng_run_count" type="number" min="1" max="10" value="1">
+
+          <label>图像尺寸</label>
+          <select id="jimeng_size">
+            {% for label, value in jimeng_sizes_map.items() %}
+            <option value="{{ value }}" {% if value == default_jimeng_size %}selected{% endif %}>{{ label }}</option>
+            {% endfor %}
+          </select>
+
+          <label>自定义尺寸</label>
+          <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+            <input id="jimeng_width" type="number" min="1024" max="4096" placeholder="宽 1024~4096" style="width: 160px;" />
+            <span>×</span>
+            <input id="jimeng_height" type="number" min="1024" max="4096" placeholder="高 1024~4096" style="width: 160px;" />
+            <span style="opacity: 0.8; font-size: 12px;">宽高都填才生效；乘积需在 1024×1024~4096×4096</span>
+          </div>
+
+          <button id="jimeng_submit">提交 即梦AI</button>
+        </div>
+        <div id="jimeng_results" class="result-list"></div>
+        <pre id="jimeng_output" class="output"></pre>
+      </section>
+
+      <section id="tab-video" class="tab-panel">
+        <div class="form">
+
+          <label>生视频模式</label>
+          <select id="vid_input_mode">
+            <option value="文生视频">文生视频</option>
+            <option value="图生视频-首帧">图生视频-首帧</option>
+            <option value="图生视频-首尾帧">图生视频-首尾帧</option>
+            <option value="图生视频-参考图">图生视频-参考图</option>
+          </select>
+          
+          <div style="margin: 10px 0;">
+             <label style="display:inline-flex; align-items:center; margin-right:15px;">
+               <input type="checkbox" id="vid_draft" /> 样片模式 (仅1.5 pro)
+             </label>
+             <label style="display:inline-flex; align-items:center;">
+               <input type="checkbox" id="vid_generate_audio" checked /> 生成音频 (仅1.5 pro)
+             </label>
+             <label style="display:inline-flex; align-items:center; margin-left:15px;">
+               <input type="checkbox" id="vid_return_last_frame" /> 返回尾帧
+             </label>
+          </div>
+
+          <label>输入</label>
+          <textarea id="vid_input" rows="4" placeholder="请输入文本或粘贴图片"></textarea>
+
+          <label>模型</label>
+          <select id="vid_model">
+            {% for label, model_id in vid_models_map.items() %}
+              <option value="{{ model_id }}" {% if model_id == default_vid_model %}selected{% endif %}>{{ label }}</option>
+            {% endfor %}
+          </select>
+
+          <label>时长（秒）</label>
+          <input id="vid_duration" type="number" min="2" max="12" value="5" />
+
+          <label>Ratio比例</label>
+          <select id="vid_ratio">
+            <option value="16:9">16:9</option>
+            <option value="4:3">4:3</option>
+            <option value="1:1">1:1</option>
+            <option value="3:4">3:4</option>
+            <option value="9:16">9:16</option>
+            <option value="21:9">21:9</option>
+            <option value="adaptive">adaptive（仅图生视频支持）</option>
+          </select>
+
+          <label>Resolution分辨率</label>
+          <select id="vid_resolution">
+            <option value="480p">480p</option>
+            <option value="720p">720p</option>
+            <option value="1080p">1080p</option>
+          </select>
+
+          <div id="img_upload_section" style="display: none;">
+            <label>上传图片</label>
+            <input id="vid_img_upload" type="file" multiple accept="image/jpeg,image/png,image/webp,image/bmp,image/tiff,image/gif" />
+            <div id="vid_preview_container" style="margin-top: 10px;"></div>
+          </div>
+
+          <label>运行次数</label>
+          <input id="vid_run_count" type="number" min="1" max="10" value="1" />
+
+
+
+          <button id="vid_submit">提交 视频生成</button>
+        </div>
+        <pre id="vid_output" class="output"></pre>
+
+    </div>
+
+    <script>
+      // 图片预览函数
+      function updatePicPreview(input) {
+        const container = document.getElementById('pic_preview_container');
+        container.innerHTML = '';
+        if (!input.files || input.files.length === 0) return;
+        
+        Array.from(input.files).forEach(file => {
+          const reader = new FileReader();
+          reader.onload = (e) => {
+            const img = document.createElement('img');
+            img.src = e.target.result;
+            img.style.maxWidth = '150px';
+            img.style.maxHeight = '150px';
+            img.style.margin = '5px';
+            img.style.borderRadius = '4px';
+            container.appendChild(img);
+          };
+          reader.readAsDataURL(file);
+        });
+      }
+      
+      function updateVidPreview(input) {
+        const container = document.getElementById('vid_preview_container');
+        container.innerHTML = '';
+        if (!input.files || input.files.length === 0) return;
+        
+        Array.from(input.files).forEach(file => {
+          const reader = new FileReader();
+          reader.onload = (e) => {
+            const previewDiv = document.createElement('div');
+            previewDiv.style.cssText = 'display: inline-block; margin: 5px; text-align: center; vertical-align: top;';
+            previewDiv.innerHTML = `
+              <img src="${e.target.result}" style="max-width: 100px; max-height: 100px; object-fit: cover; border: 1px solid #ddd; border-radius: 4px;">
+              <div style="font-size: 12px; margin-top: 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100px;">${file.name}</div>
+              <div style="font-size: 10px; color: #666;">${(file.size / 1024).toFixed(1)}KB</div>
+            `;
+            container.appendChild(previewDiv);
+          };
+          reader.readAsDataURL(file);
+        });
+      }
+      
+      // 文件选择预览事件
+      document.addEventListener('DOMContentLoaded', () => {
+        // 初始隐藏reasoning effort选项
+        const updateReasoningVisibility = () => {
+          const thinkingMode = document.getElementById('ep_thinking_mode').checked ? 'enabled' : 'disabled';
+          const reasoningContainer = document.getElementById('ep_reasoning_container');
+          
+          if (thinkingMode === 'enabled') {
+            reasoningContainer.style.display = '';
+          } else {
+            reasoningContainer.style.display = 'none';
+          }
+        };
+        
+        // 初始设置
+        updateReasoningVisibility();
+        
+        // 添加事件监听
+        document.getElementById('ep_thinking_mode').addEventListener('change', updateReasoningVisibility);
+        
+        // 批量处理相关事件监听器
+        const batchFileInput = document.getElementById('ep_batch_file');
+        const picBatchFileInput = document.getElementById('pic_batch_file');
+        const downloadBtn = document.getElementById('ep_download_results');
+        
+        // EP推理批量文件上传事件
+        if (batchFileInput) {
+          batchFileInput.addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            
+            try {
+              showToast('正在解析文件...', 'info');
+              const questions = await parseExcelOrCSV(file);
+              showToast(`成功导入 ${questions.length} 个问题`, 'success');
+              // 显示问题列表（前5行和最后1行）
+              displayQuestionList(questions, 'ep_question_list');
+              // 将解析后的问题存储在file input元素上
+              e.target.questions = questions;
+            } catch (error) {
+              showToast('文件解析失败: ' + error.message, 'error');
+              e.target.questions = null;
+            }
+          });
+        }
+        
+        // 图片生成批量文件上传事件
+        if (picBatchFileInput) {
+          picBatchFileInput.addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            
+            try {
+              showToast('正在解析文件...', 'info');
+              const questions = await parseExcelOrCSV(file);
+              showToast(`成功导入 ${questions.length} 个问题`, 'success');
+              // 显示问题列表（前5行和最后1行）
+              displayQuestionList(questions, 'pic_question_list');
+              // 将解析后的问题存储在file input元素上
+              e.target.questions = questions;
+            } catch (error) {
+              showToast('文件解析失败: ' + error.message, 'error');
+              e.target.questions = null;
+            }
+          });
+        }
+        
+
+        
+        // 下载结果按钮点击事件
+        if (downloadBtn) {
+          downloadBtn.addEventListener('click', () => {
+            // EP推理下载功能已定义
+          });
+        }
+        
+        // 图片生成下载结果按钮点击事件
+        const picDownloadBtn = document.getElementById('pic_download_results');
+        if (picDownloadBtn) {
+          picDownloadBtn.addEventListener('click', async () => {
+            showToast('正在生成包含图片的Excel文件，请稍候...', 'info');
+            
+            // 收集所有生成的图片数据
+            const results = [];
+            const resultCards = document.querySelectorAll('#pic_output .result-card');
+            const questions = [];
+            
+            // 获取批量上传的问题（如果有）
+            const batchFileInput = document.getElementById('pic_batch_file');
+            const batchQuestions = batchFileInput.questions || [];
+            
+            // 收集所有图片生成结果
+            for (let i = 0; i < resultCards.length; i++) {
+              const card = resultCards[i];
+              const images = card.querySelectorAll('img');
+              const questionText = card.querySelector('.final-answer-title').textContent.replace(/问题 \d+: /, '');
+              
+              // 提取图片URLs
+              const imageUrls = Array.from(images).map(img => img.src);
+              
+              if (imageUrls.length > 0) {
+                // 构建与后端API期望格式一致的结果数据
+                const result = {
+                  "data": imageUrls.map(url => ({ "url": url })),
+                  "model": "未知模型",
+                  "generation_time": "未知耗时"
+                };
+                results.push(result);
+                questions.push(questionText);
+              } else {
+                // 处理生成失败的情况
+                const errorText = card.querySelector('.md-content').textContent;
+                results.push({ "error": errorText });
+                questions.push(questionText);
+              }
+            }
+            
+            if (results.length === 0) {
+              showToast('没有可下载的图片结果', 'warning');
+              return;
+            }
+            
+            try {
+              // 调用后端API生成包含图片的Excel
+              const response = await fetch('/api/generate_excel', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                  "results": results,
+                  "questions": questions
+                })
+              });
+              
+              if (!response.ok) {
+                const errorData = await response.json();
+                throw new Error(errorData.error || '生成Excel失败');
+              }
+              
+              // 处理下载
+              const blob = await response.blob();
+              const url = window.URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.style.display = 'none';
+              a.href = url;
+              
+              // 获取上传文件名
+              const uploadedFile = batchFileInput.files[0];
+              let fileName;
+              
+              if (uploadedFile) {
+                // 提取原文件名（不含扩展名）
+                const originalName = uploadedFile.name.replace(/\.[^/.]+$/, "");
+                // 生成新文件名：原文件名 + _result.xlsx
+                fileName = `${originalName}_result.xlsx`;
+              } else {
+                // 使用默认文件名
+                fileName = `图片生成结果_${new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-')}.xlsx`;
+              }
+              
+              a.download = fileName;
+              document.body.appendChild(a);
+              a.click();
+              window.URL.revokeObjectURL(url);
+              document.body.removeChild(a);
+              
+              showToast(`已成功生成并下载包含 ${results.length} 个结果的Excel文件`, 'success');
+              
+            } catch (error) {
+              console.error('生成Excel失败:', error);
+              showToast('生成Excel失败: ' + error.message, 'error');
+            }
+          });
+        }
+        
+        // 显示下载方案选择对话框
+        function showDownloadChoiceDialog() {
+          return new Promise((resolve) => {
+            // 创建对话框
+            const dialog = document.createElement('div');
+            dialog.style.cssText = `
+              position: fixed;
+              top: 0;
+              left: 0;
+              width: 100%;
+              height: 100%;
+              background: rgba(0,0,0,0.5);
+              display: flex;
+              align-items: center;
+              justify-content: center;
+              z-index: 10000;
+            `;
+            
+            const content = document.createElement('div');
+            content.style.cssText = `
+              background: #111827;
+              border: 1px solid #1f2937;
+              padding: 20px;
+              border-radius: 8px;
+              max-width: 500px;
+              width: 90%;
+              color: #e2e8f0;
+            `;
+            
+            content.innerHTML = `
+              <h3 style="margin-top: 0; color: #e2e8f0;">选择下载方案</h3>
+              <p style="color: #cbd5e1;">请选择您希望的下载方式：</p>
+              
+              <div style="margin: 15px 0;">
+                <label style="display: block; margin: 10px 0; cursor: pointer;">
+                  <input type="radio" name="downloadOption" value="image" checked>
+                  <strong>方案一：图片插入Excel</strong><br>
+                  <small style="color: #94a3b8;">将图片直接插入Excel单元格，方便查看但文件较大</small>
+                </label>
+                
+                <label style="display: block; margin: 10px 0; cursor: pointer;">
+                  <input type="radio" name="downloadOption" value="hyperlink">
+                  <strong>方案二：超链接方式</strong><br>
+                  <small style="color: #94a3b8;">生成包含图片链接的Excel，文件较小但需要联网查看</small>
+                </label>
+              </div>
+              
+              <div style="text-align: right; margin-top: 20px;">
+                <button id="confirmDownload" style="background: #007bff; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer;">确认下载</button>
+                <button id="cancelDownload" style="background: #6c757d; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; margin-left: 10px;">取消</button>
+              </div>
+            `;
+            
+            dialog.appendChild(content);
+            document.body.appendChild(dialog);
+            
+            // 事件处理
+            document.getElementById('confirmDownload').addEventListener('click', () => {
+              const selectedOption = document.querySelector('input[name="downloadOption"]:checked').value;
+              document.body.removeChild(dialog);
+              resolve(selectedOption);
+            });
+            
+            document.getElementById('cancelDownload').addEventListener('click', () => {
+              document.body.removeChild(dialog);
+              resolve(null);
+            });
+            
+            // 点击背景关闭
+            dialog.addEventListener('click', (e) => {
+              if (e.target === dialog) {
+                document.body.removeChild(dialog);
+                resolve(null);
+              }
+            });
+          });
+        }
+        
+        // 方案一：将图片插入Excel
+        async function downloadWithImages(imageData, fileName) {
+          showToast('正在生成包含图片的Excel文件...', 'info');
+          
+          // 创建Excel工作簿
+          const workbook = XLSX.utils.book_new();
+          
+          // 准备基础数据
+          const excelData = imageData.map((item, index) => ({
+            '序号': index + 1,
+            '提示词': item.question,
+            '图片状态': item.success ? '已插入' : '下载失败',
+            '图片URL': item.imageUrl || '无',
+            '错误原因': item.errorMsg || ''
+          }));
+          
+          // 创建工作表
+          const worksheet = XLSX.utils.json_to_sheet(excelData);
+          
+          // 设置列宽
+          worksheet['!cols'] = [
+            { wch: 8 },   // 序号列
+            { wch: 50 },  // 提示词列
+            { wch: 12 },  // 图片状态列
+            { wch: 80 },  // 图片URL列
+            { wch: 50 }   // 错误原因列
+          ];
+          
+          // 由于SheetJS社区版不支持直接插入图片，我们采用以下替代方案：
+          // 1. 在Excel中创建图片链接列
+          // 2. 同时生成包含图片的HTML文件作为补充
+          
+          // 添加图片链接列
+          for (let i = 0; i < imageData.length; i++) {
+            const item = imageData[i];
+            if (item.success) {
+              try {
+                const imageIndex = i + 2; // +2是因为第一行是标题，数据从第二行开始
+                const imageCell = `E${imageIndex}`; // E列为图片链接列
+                
+                // 创建图片链接
+                worksheet[imageCell] = {
+                  l: { Target: item.imageUrl }, // 超链接
+                  v: `查看图片${i + 1}`,        // 显示文本
+                  t: 's'                        // 字符串类型
+                };
+                
+              } catch (error) {
+                console.error('处理图片链接失败:', error);
+                const errorCell = `E${i + 2}`;
+                worksheet[errorCell] = { t: 's', v: '图片链接处理失败' };
+              }
+            }
+          }
+          
+          // 添加工作表到工作簿
+          XLSX.utils.book_append_sheet(workbook, worksheet, '图片生成结果');
+          
+          // 生成Excel文件
+          const excelBuffer = XLSX.write(workbook, { bookType: 'xlsx', type: 'array' });
+          const blob = new Blob([excelBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+          const url = URL.createObjectURL(blob);
+          
+          // 创建下载链接
+          const downloadLink = document.createElement('a');
+          downloadLink.style.display = 'none';
+          downloadLink.href = url;
+          downloadLink.download = fileName.replace('.xlsx', '_with_images.xlsx');
+          
+          document.body.appendChild(downloadLink);
+          downloadLink.click();
+          document.body.removeChild(downloadLink);
+          URL.revokeObjectURL(url);
+          
+          showToast(`已下载 ${imageData.filter(item => item.success).length} 个图片结果（图片插入模式）`, 'success');
+        }
+        
+        // 方案二：超链接方式
+        async function downloadWithHyperlinks(imageData, fileName) {
+          showToast('正在生成包含图片链接的Excel文件...', 'info');
+          
+          // 创建Excel工作簿
+          const workbook = XLSX.utils.book_new();
+          
+          // 准备Excel数据 - 使用超链接格式
+          const excelData = imageData.map((item, index) => ({
+            '序号': index + 1,
+            '提示词': item.question,
+            '图片链接': item.imageUrl ? {
+              l: { Target: item.imageUrl }, // 超链接
+              v: `图片${index + 1}`,        // 显示文本
+              t: 's'                        // 字符串类型
+            } : '无链接',
+            '图片URL': item.imageUrl || '无',
+            '链接状态': item.success ? '正常' : '下载失败',
+            '错误原因': item.errorMsg || ''
+          }));
+          
+          // 创建工作表
+          const worksheet = XLSX.utils.json_to_sheet(excelData);
+          
+          // 设置列宽
+          worksheet['!cols'] = [
+            { wch: 8 },   // 序号列
+            { wch: 50 },  // 提示词列
+            { wch: 15 },  // 图片链接列
+            { wch: 80 },  // 图片URL列
+            { wch: 12 },  // 链接状态列
+            { wch: 50 }   // 错误原因列
+          ];
+          
+          // 添加工作表到工作簿
+          XLSX.utils.book_append_sheet(workbook, worksheet, '图片生成结果');
+          
+          // 生成Excel文件
+          const excelBuffer = XLSX.write(workbook, { bookType: 'xlsx', type: 'array' });
+          const blob = new Blob([excelBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+          const url = URL.createObjectURL(blob);
+          
+          // 创建下载链接
+          const downloadLink = document.createElement('a');
+          downloadLink.style.display = 'none';
+          downloadLink.href = url;
+          downloadLink.download = fileName.replace('.xlsx', '_with_links.xlsx');
+          
+          document.body.appendChild(downloadLink);
+          downloadLink.click();
+          document.body.removeChild(downloadLink);
+          URL.revokeObjectURL(url);
+          
+          showToast(`已下载 ${imageData.filter(item => item.success).length} 个图片结果（超链接模式）`, 'success');
+        }
+      });
+      
+      // 粘贴事件监听
+      document.addEventListener('paste', (e) => {
+        const items = (e.clipboardData || window.clipboardData).items;
+        if (!items) return;
+        
+        let pastedImage = null;
+        for (const item of items) {
+          if (item.type.startsWith('image/')) {
+            pastedImage = item.getAsFile();
+            break;
+          }
+        }
+        
+        if (!pastedImage) return;
+        
+        // 创建File对象
+        const file = new File([pastedImage], `pasted_${Date.now()}.png`, { type: pastedImage.type });
+        
+        // 检查当前激活的标签页
+        const activeTab = document.querySelector('.tab-btn.active')?.getAttribute('data-tab');
+        if (!activeTab) return;
+        
+        if (activeTab === 'picture-generation') {
+          // 图片生成模块
+          const input = document.getElementById('pic_reference_image');
+          // 自动切换到图生图模式
+          document.getElementById('pic_input_mode').value = 'image_to_image';
+          // 显示参考图片上传容器
+          document.getElementById('pic_reference_upload_container').style.display = 'block';
+          
+          const dataTransfer = new DataTransfer();
+          // 替换为新粘贴的图片
+          dataTransfer.items.add(file);
+          input.files = dataTransfer.files;
+          
+          // 更新预览
+          updatePicPreview(input);
+          showToast('图片已粘贴并切换到图生图模式', 'success');
+        } else if (activeTab === 'video-generation') {
+          // 视频生成模块
+          const input = document.getElementById('vid_img_upload');
+          // 自动切换到图生视频模式
+          document.getElementById('vid_input_mode').value = 'image_to_video';
+          // 显示图片上传区域
+          document.getElementById('img_upload_section').style.display = 'block';
+          
+          const dataTransfer = new DataTransfer();
+          
+          // 保留已有文件
+          if (input.files) {
+             Array.from(input.files).forEach(f => dataTransfer.items.add(f));
+          }
+          
+          // 添加新粘贴的图片
+          dataTransfer.items.add(file);
+          input.files = dataTransfer.files;
+          
+          // 更新预览
+          updateVidPreview(input);
+          showToast('图片已粘贴并添加到列表', 'success');
+        }
+      });
+      // Tabs
+      const tabButtons = document.querySelectorAll('.tab-btn');
+      const tabPanels = document.querySelectorAll('.tab-panel');
+      tabButtons.forEach(btn => {
+        btn.addEventListener('click', () => {
+          const target = btn.getAttribute('data-tab');
+          tabButtons.forEach(b => b.classList.remove('active'));
+          btn.classList.add('active');
+          tabPanels.forEach(panel => panel.classList.remove('active'));
+          document.getElementById(target).classList.add('active');
+        });
+      });
+
+      // Toast helper
+      function showToast(message, type = 'info') {
+        const container = document.getElementById('toast-container');
+        const el = document.createElement('div');
+        el.className = `toast toast-${type}`;
+        el.textContent = message;
+        container.appendChild(el);
+        setTimeout(() => {
+          el.classList.add('fade-out');
+          setTimeout(() => container.removeChild(el), 400);
+        }, 1600);
+      }
+
+      // Minimal markdown renderer (safe-ish)
+      function escapeHtml(s) {
+        return String(s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','\'':'&#39;'}[c]));
+      }
+      function markdownToHtml(md) {
+        let text = escapeHtml(md || '');
+        
+        // 先处理表格，避免被其他处理干扰
+        text = text.replace(/\|([^\n]+)\|\s*\n\|\s*[-:]+\s*(?:\|\s*[-:]+\s*)*\|\s*\n((?:\|.*\|\s*\n)*)/g, (match, header, rows) => {
+          try {
+            // 处理表头
+            const headerCells = header.split('|').map(cell => cell.trim()).filter(cell => cell);
+            const headerHtml = headerCells.map(cell => `<th>${cell}</th>`).join('');
+            
+            // 处理表格行
+            const rowLines = rows.trim().split('\n').filter(line => line.trim());
+            const rowsHtml = rowLines.map(line => {
+              const cells = line.split('|').map(cell => cell.trim()).filter(cell => cell);
+              // 在表格单元格中不转义HTML标签，允许<br>等标签正常工作
+              return `<tr>${cells.map(cell => `<td>${cell.replace(/&lt;br&gt;/g, '<br>').replace(/&lt;(\/?[a-z][a-z0-9]*)([^>]*)&gt;/g, '<$1$2>')}</td>`).join('')}</tr>`;
+            }).join('');
+            
+            return `<table class="markdown-table"><thead><tr>${headerHtml}</tr></thead><tbody>${rowsHtml}</tbody></table>`;
+          } catch (error) {
+            // 如果表格解析失败，返回原始内容
+            console.warn('表格解析失败:', error);
+            return match;
+          }
+        });
+        
+        // 先处理列表，避免被段落处理干扰
+        // 有序列表
+        text = text.replace(/^(\d+\.\s.+)(?:\n\d+\.\s.+)*/gm, (match) => {
+          const items = match.split('\n').map(line => line.replace(/^\d+\.\s(.+)/, '<li>$1</li>')).join('');
+          return `<ol>${items}</ol>`;
+        });
+        
+        // 无序列表
+        text = text.replace(/^(-\s.+)(?:\n-\s.+)*/gm, (match) => {
+          const items = match.split('\n').map(line => line.replace(/^-\s(.+)/, '<li>$1</li>')).join('');
+          return `<ul>${items}</ul>`;
+        });
+        
+        // Code blocks
+        text = text.replace(/```([\s\S]*?)```/g, (m, p1) => `<pre class="code-block"><code>${p1}</code></pre>`);
+        // Inline code
+        text = text.replace(/`([^`]+)`/g, (m, p1) => `<code>${p1}</code>`);
+        // Headings
+        text = text.replace(/^######\s(.+)$/gm, '<h6>$1</h6>')
+                   .replace(/^#####\s(.+)$/gm, '<h5>$1</h5>')
+                   .replace(/^####\s(.+)$/gm, '<h4>$1</h4>')
+                   .replace(/^###\s(.+)$/gm, '<h3>$1</h3>')
+                   .replace(/^##\s(.+)$/gm, '<h2>$1</h2>')
+                   .replace(/^#\s(.+)$/gm, '<h1>$1</h1>');
+        // Bold & Italic - 改进的匹配逻辑，避免误匹配
+        text = text.replace(/\*\*([^*]+?)\*\*/g, '<strong>$1</strong>')
+                   .replace(/\*([^*\s][^*]*?[^*\s])\*/g, '<em>$1</em>');
+        // Links [text](url)
+        text = text.replace(/\[([^\]]+)\]\((https?:[^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+        
+        // 段落处理：先按行分割，再重新构建
+        const lines = text.split('\n');
+        const paragraphs = [];
+        let currentParagraph = [];
+        
+        for (const line of lines) {
+          const trimmedLine = line.trim();
+          if (!trimmedLine) {
+            // 空行表示段落分隔
+            if (currentParagraph.length > 0) {
+              paragraphs.push(currentParagraph.join(' '));
+              currentParagraph = [];
+            }
+          } else if (trimmedLine.startsWith('<') && (trimmedLine.includes('</li>') || trimmedLine.includes('</ol>') || trimmedLine.includes('</ul>') || trimmedLine.includes('</h') || trimmedLine.includes('</pre>') || trimmedLine.includes('</table>'))) {
+            // 如果是HTML标签（列表、标题、代码块、表格等），单独处理
+            if (currentParagraph.length > 0) {
+              paragraphs.push(currentParagraph.join(' '));
+              currentParagraph = [];
+            }
+            paragraphs.push(trimmedLine);
+          } else {
+            currentParagraph.push(trimmedLine);
+          }
+        }
+        
+        // 处理最后一个段落
+        if (currentParagraph.length > 0) {
+          paragraphs.push(currentParagraph.join(' '));
+        }
+        
+        // 将段落包装在p标签中
+        text = paragraphs.map(p => {
+          if (p.startsWith('<') && (p.includes('</li>') || p.includes('</ol>') || p.includes('</ul>') || p.includes('</h') || p.includes('</pre>') || p.includes('</table>'))) {
+            return p; // 已经是HTML标签，不包装
+          }
+          return `<p>${p}</p>`;
+        }).join('\n');
+        
+        return text;
+      }
+
+      async function postJSON(url, body) {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const data = await res.json();
+        return { ok: res.ok, data };
+      }
+
+      // 联网问答批量处理函数实现
+      async function handleNqBatchProcessing(questions, config) {
+        nqBatchResults = [];
+        const container = document.getElementById('nq_results');
+        container.innerHTML = '';
+        
+        // 隐藏导出容器
+        document.getElementById('nq_export_container').style.display = 'none';
+        
+        // 为每个问题创建独立的结果卡片
+        questions.forEach((question, index) => {
+          const card = document.createElement('div');
+          card.className = 'result-card';
+          card.innerHTML = `
+            <div class="result-main">
+              <div class="final-answer-title">问题 ${index+1}: ${question.question}</div>
+              <div id="nq_batch_reasoning_${index}" class="reasoning-box" style="display:none;">
+                <div class="reasoning-title">思考过程</div>
+                <div class="md-content" id="nq_batch_reasoning_md_${index}"></div>
+              </div>
+              <div class="md-content" id="nq_batch_content_${index}"></div>
+            </div>
+            <div class="result-meta" id="nq_batch_meta_${index}"></div>
+          `;
+          container.appendChild(card);
+        });
+        
+        // 并发处理问题
+        const questionsCount = questions.length;
+        let concurrentLimit;
+        if (questionsCount <= 10) {
+          concurrentLimit = 10;
+        } else {
+          concurrentLimit = Math.max(10, Math.min(Math.floor(questionsCount / 2), 20));
+        }
+        
+        const promises = [];
+        
+        for (let i = 0; i < questions.length; i++) {
+          const question = questions[i];
+          
+          const promise = new Promise((resolve, reject) => {
+            const params = new URLSearchParams({
+              input: question.question || '',
+              system_prompt: config.system_prompt || '',
+              thinking: config.thinking,
+            });
+            
+            const url = `/api/network_qa_chat_stream?${params.toString()}`;
+            const es = new EventSource(url);
+            let content = '';
+            let reasoning_content = '';
+            let lastUpdateMs = 0;
+            
+            es.onmessage = (e) => {
+              try {
+                const data = JSON.parse(e.data);
+                if (data.event === 'content_delta') {
+                  const now = Date.now();
+                  if (now - lastUpdateMs < 30) return; // 防抖处理
+                  lastUpdateMs = now;
+                  
+                  // 智能内容处理：检测增量还是累积内容
+                  if (data.content) {
+                    if (data.content.length > content.length) {
+                      // 累积内容，直接使用
+                      content = data.content;
+                    } else {
+                      // 增量内容，需要追加
+                      content += data.content;
+                    }
+                    document.getElementById(`nq_batch_content_${i}`).innerHTML = markdownToHtml(content || '');
+                  }
+                  
+                  if (data.reasoning_content) {
+                    if (data.reasoning_content.length > reasoning_content.length) {
+                      // 累积内容，直接使用
+                      reasoning_content = data.reasoning_content;
+                    } else {
+                      // 增量内容，需要追加
+                      reasoning_content += data.reasoning_content;
+                    }
+                    document.getElementById(`nq_batch_reasoning_md_${i}`).innerHTML = markdownToHtml(reasoning_content || '');
+                    document.getElementById(`nq_batch_reasoning_${i}`).style.display = 'block';
+                  }
+                } else if (data.event === 'final') {
+                  document.getElementById(`nq_batch_content_${i}`).innerHTML = markdownToHtml(data.content || '');
+                  if (data.reasoning_content) {
+                    document.getElementById(`nq_batch_reasoning_md_${i}`).innerHTML = markdownToHtml(data.reasoning_content || '');
+                    document.getElementById(`nq_batch_reasoning_${i}`).style.display = 'block';
+                  }
+                  
+                  const meta = [];
+                  const u = data.usage || {};
+                  if (u.prompt_tokens || u.completion_tokens || u.total_tokens) {
+                    meta.push(`<span class="meta-pill">Prompt: ${u.prompt_tokens ?? 'N/A'}</span>`);
+                    meta.push(`<span class="meta-pill">Completion: ${u.completion_tokens ?? 'N/A'}</span>`);
+                    meta.push(`<span class="meta-pill">Total: ${u.total_tokens ?? 'N/A'}</span>`);
+                  }
+                  if (typeof data.first_token_time === 'number') {
+                    meta.push(`<span class="meta-pill">TTFT: ${data.first_token_time.toFixed(2)}s</span>`);
+                  }
+                  if (typeof data.total_time === 'number') {
+                    meta.push(`<span class="meta-pill">耗时 ${data.total_time.toFixed(2)}s</span>`);
+                  }
+                  document.getElementById(`nq_batch_meta_${i}`).innerHTML = meta.join(' ');
+                  
+                  // 保存结果到批量结果数组
+                  nqBatchResults.push({
+                    id: data.id || '',
+                    question: question.question || '',
+                    content: data.content || '',
+                    system_prompt: config.system_prompt || '',
+                    usage: data.usage || {},
+                    first_token_time: data.first_token_time || 0,
+                    total_time: data.total_time || 0,
+                    thinking: config.thinking || ''
+                  });
+                  
+                  es.close();
+                  resolve();
+                } else if (data.event === 'error') {
+                  es.close();
+                  reject(new Error(data.message || '处理失败'));
+                }
+              } catch (err) {
+                es.close();
+                reject(err);
+              }
+            };
+            
+            es.onerror = () => {
+              es.close();
+              reject(new Error('连接错误'));
+            };
+          });
+          
+          promises.push(promise);
+          
+          // 控制并发数量
+          if (promises.length >= concurrentLimit) {
+            await Promise.race(promises);
+          }
+        }
+        
+        // 等待所有请求完成
+        await Promise.all(promises);
+        
+        // 显示导出容器
+        if (nqBatchResults.length > 0) {
+          document.getElementById('nq_export_container').style.display = 'block';
+        }
+        
+        showToast('批量处理完成', 'success');
+      }
+
+      // EP推理批量处理函数实现
+      async function handleBatchProcessing(questions, config) {
+        epBatchResults = [];
+        const container = document.getElementById('ep_results');
+        container.innerHTML = '';
+        
+        // 为每个问题创建独立的结果卡片
+        questions.forEach((question, index) => {
+          const card = document.createElement('div');
+          card.className = 'result-card';
+          card.innerHTML = `
+            <div class="result-main">
+              <div class="final-answer-title">问题 ${index+1}: ${question.question}</div>
+              <div id="ep_batch_reasoning_${index}" class="reasoning-box" style="display:none;">
+                <div class="reasoning-title">思考过程</div>
+                <div class="md-content" id="ep_batch_reasoning_md_${index}"></div>
+              </div>
+              <div class="md-content" id="ep_batch_content_${index}"></div>
+            </div>
+            <div class="result-meta" id="ep_batch_meta_${index}"></div>
+          `;
+          container.appendChild(card);
+        });
+        
+        // 并发处理问题 - 与单个问题多次运行的并发数逻辑保持一致
+        const questionsCount = questions.length;
+        let concurrentLimit;
+        if (questionsCount <= 10) {
+          concurrentLimit = 10; // 10个问题以内，并发数设为10
+        } else {
+          concurrentLimit = Math.max(10, Math.min(Math.floor(questionsCount / 2), 20)); // 10个问题以上，并发数10-20，最多20
+        }
+        const promises = [];
+        
+        for (let i = 0; i < questions.length; i++) {
+          const question = questions[i];
+          
+          // 使用Promise包装每个问题的处理
+          const promise = new Promise((resolve, reject) => {
+            // 创建 SSE 连接
+          const params = new URLSearchParams({
+            input: question.question || '',
+            api_key: config.api_key || '',
+            model: config.model || '',
+            system_prompt: config.system_prompt || '',
+            thinking_mode: config.thinking_mode,
+            reasoning_effort: config.reasoning_effort || 'medium',
+            temperature: config.temperature || 0.009,
+            top_p: config.top_p || 0.7,
+            max_tokens: config.max_tokens || 4094,
+          });
+            
+            const url = `/api/ep_chat_stream?${params.toString()}`;
+            const es = new EventSource(url);
+            let content = '';
+            let reasoning_content = '';
+            
+            es.onmessage = (e) => {
+              try {
+                const data = JSON.parse(e.data);
+                if (data.event === 'content_delta') {
+                  content = data.content;
+                  const cEl = document.getElementById(`ep_batch_content_${i}`);
+                  if (cEl) cEl.innerHTML = markdownToHtml(content || '');
+                  
+                  if (data.reasoning_content) {
+                    reasoning_content = data.reasoning_content;
+                    const rBox = document.getElementById(`ep_batch_reasoning_${i}`);
+                    const rEl = document.getElementById(`ep_batch_reasoning_md_${i}`);
+                    if (rBox) rBox.style.display = '';
+                    if (rEl) rEl.innerHTML = markdownToHtml(reasoning_content || '');
+                  }
+                } else if (data.event === 'final') {
+                  // 更新完整内容
+                  content = data.content;
+                  const cEl = document.getElementById(`ep_batch_content_${i}`);
+                  if (cEl) cEl.innerHTML = markdownToHtml(content || '');
+                  
+                  if (data.reasoning_content) {
+                    reasoning_content = data.reasoning_content;
+                    const rBox = document.getElementById(`ep_batch_reasoning_${i}`);
+                    const rEl = document.getElementById(`ep_batch_reasoning_md_${i}`);
+                    if (rBox) rBox.style.display = '';
+                    if (rEl) rEl.innerHTML = markdownToHtml(reasoning_content || '');
+                  }
+                  
+                  // 更新元信息
+                  const meta = [];
+                  if (data.id) meta.push(`<span class="meta-pill">ID: ${data.id}</span>`);
+                  const u = data.usage || {};
+                  if (u.prompt_tokens || u.completion_tokens || u.total_tokens) {
+                    meta.push(`<span class="meta-pill">Prompt: ${u.prompt_tokens ?? 'N/A'}</span>`);
+                    meta.push(`<span class="meta-pill">Completion: ${u.completion_tokens ?? 'N/A'}</span>`);
+                    meta.push(`<span class="meta-pill">Total: ${u.total_tokens ?? 'N/A'}</span>`);
+                  }
+                  if (typeof data.first_token_time === 'number') {
+                    meta.push(`<span class="meta-pill">TTFT: ${data.first_token_time.toFixed(2)}s</span>`);
+                  }
+                  if (typeof data.total_time === 'number') {
+                    meta.push(`<span class="meta-pill">耗时 ${data.total_time.toFixed(2)}s</span>`);
+                  }
+                  const mEl = document.getElementById(`ep_batch_meta_${i}`);
+                  if (mEl) mEl.innerHTML = meta.join(' ');
+                  
+                  // 保存结果
+                  epBatchResults.push({
+                    id: data.id || '',
+                    question: question.question || '',
+                    content: content || '',
+                    reasoning: reasoning_content || '',
+                    system_prompt: config.system_prompt || '',
+                    usage: u,
+                    total_time: data.total_time || 0,
+                    first_token_time: data.first_token_time || 0,
+                    model: config.model || '',
+                    thinking_mode: config.thinking_mode || '',
+                    temperature: config.temperature || 0,
+                    top_p: config.top_p || 0,
+                    max_tokens: config.max_tokens || 0
+                  });
+                  
+                  es.close();
+                  resolve();
+                } else if (data.event === 'error') {
+                  es.close();
+                  reject(new Error(data.message || 'Unknown error'));
+                }
+              } catch (err) {
+                // ignore parse errors
+              }
+            };
+            
+            es.onerror = () => {
+              es.close();
+              reject(new Error('Connection error'));
+            };
+          });
+          
+          promises.push(promise);
+        }
+        
+        // 并发执行所有请求
+        const batchSize = Math.min(concurrentLimit, promises.length);
+        for (let i = 0; i < promises.length; i += batchSize) {
+          const batch = promises.slice(i, i + batchSize);
+          await Promise.all(batch);
+          showToast(`已处理 ${Math.min(i + batchSize, promises.length)}/${promises.length} 个问题`, 'info');
+        }
+        
+        // 显示下载按钮
+        if (epBatchResults.length > 0) {
+          document.getElementById('ep_export_container').style.display = 'block';
+        }
+        
+        showToast('批量处理完成', 'success');
+      }
+
+      // EP推理输入框粘贴事件
+      document.getElementById('ep_input').addEventListener('paste', (e) => {
+        const items = e.clipboardData.items;
+        for (const item of items) {
+          if (item.type.startsWith('image/')) {
+            const file = item.getAsFile();
+            if (!file) return;
+            
+            // 创建DataTransfer对象
+            const dataTransfer = new DataTransfer();
+            dataTransfer.items.add(file);
+            
+            // 将文件设置到ep_image文件输入框
+            const imageInput = document.getElementById('ep_image');
+            imageInput.files = dataTransfer.files;
+            
+            // 创建预览
+            const reader = new FileReader();
+            reader.onload = function(ev) {
+              // 移除旧的预览
+              const existingPreview = document.getElementById('ep_image_preview');
+              if (existingPreview) {
+                existingPreview.remove();
+              }
+              
+              // 创建新的预览
+              const previewDiv = document.createElement('div');
+              previewDiv.id = 'ep_image_preview';
+              previewDiv.style.cssText = 'margin-top: 10px; margin-bottom: 10px;';
+              previewDiv.innerHTML = `
+                <div style="display: inline-block; margin: 5px; text-align: center;">
+                  <img src="${ev.target.result}" style="max-width: 200px; max-height: 200px; object-fit: cover; border: 1px solid #ddd; border-radius: 4px;">
+                  <div style="font-size: 12px; margin-top: 5px;">粘贴的图片</div>
+                  <div style="font-size: 10px; color: #666;">${(file.size / 1024).toFixed(1)}KB</div>
+                </div>
+              `;
+              
+              // 将预览添加到文件输入框下方
+              imageInput.parentNode.insertBefore(previewDiv, imageInput.nextSibling);
+            };
+            reader.readAsDataURL(file);
+            
+            break;
+          }
+        }
+      });
+
+      document.getElementById('ep_submit').addEventListener('click', async (ev) => {
+        // 关闭所有正在运行的 SSE 连接
+        if (currentEs) {
+          currentEs.close();
+          currentEs = null;
+        }
+        if (currentEsMulti) {
+          currentEsMulti.close();
+          currentEsMulti = null;
+        }
+        // 清空输出容器
+        const container = document.getElementById('ep_results');
+        container.innerHTML = '';
+        
+        // 清空之前的结果
+        epBatchResults = [];
+        
+        // 隐藏下载按钮
+        document.getElementById('ep_export_container').style.display = 'none';
+
+        const btn = ev.currentTarget;
+        const input = (document.getElementById('ep_input') || {}).value || '';
+        const api_key = (document.getElementById('ep_api_key') || {}).value || null;
+        const model = (document.getElementById('ep_model') || {}).value || null;
+        const system_prompt = (document.getElementById('ep_system_prompt') || {}).value || null;
+        const thinking_mode = (document.getElementById('ep_thinking_mode') || {}).checked ? 'enabled' : 'disabled';
+        const reasoning_effort = (document.getElementById('ep_reasoning_effort') || {}).value || 'medium';
+        const run_count = parseInt((document.getElementById('ep_run_count') || {}).value || '1', 10);
+        const temperature = parseFloat((document.getElementById('ep_temperature') || {}).value) || 0.009;
+        const top_p = parseFloat((document.getElementById('ep_top_p') || {}).value) || 0.7;
+        const max_tokens = parseInt((document.getElementById('ep_max_tokens') || {}).value) || 4094;
+        const uploadedImage = (document.getElementById('ep_image') && document.getElementById('ep_image').files && document.getElementById('ep_image').files[0]) || null;
+        const batchFileInput = document.getElementById('ep_batch_file');
+        const batchFile = batchFileInput.files[0];
+        const batchQuestions = batchFileInput.questions || [];
+        
+        // 检查是否是批量处理
+        const isBatchProcessing = batchQuestions.length > 0;
+        
+        showToast('已提交请求，正在处理…', 'success');
+        btn.disabled = true;
+        const old = btn.textContent;
+        btn.textContent = '稍等…';
+        
+        // 如果是批量处理
+        if (isBatchProcessing) {
+          await handleBatchProcessing(batchQuestions, {
+            api_key,
+            model,
+            system_prompt,
+            thinking_mode,
+            reasoning_effort,
+            run_count,
+            temperature,
+            top_p,
+            max_tokens
+          });
+          
+          btn.disabled = false;
+          btn.textContent = old;
+          showToast('批量处理完成', 'success');
+          
+          // 显示下载按钮
+          if (epBatchResults.length > 0) {
+            document.getElementById('ep_export_container').style.display = 'block';
+          }
+          
+          return;
+        }
+        
+        // 流式输出仅支持 run_count=1
+        const streaming = true; // 强制开启流式输出
+        let ok, data;
+        
+        // 如果有上传的图片
+        if (uploadedImage) {
+          // 初始化结果卡片
+          const container = document.getElementById('ep_results');
+          container.innerHTML = '';
+          for (let i = 0; i < run_count; i++) {
+            const card = document.createElement('div');
+            card.className = 'result-card';
+            card.innerHTML = `
+              <div class="result-main">
+                <div class="final-answer-title">${run_count > 1 ? `问题 ${i+1}: ${input}` : `问题: ${input}`}</div>
+                <div class="reasoning-box" id="ep_stream_reasoning_${i}" style="display:none;">
+                  <div class="reasoning-title">思考过程</div>
+                  <div class="md-content" id="ep_stream_reasoning_md_${i}"></div>
+                </div>
+                <div class="md-content" id="ep_stream_content_${i}"></div>
+              </div>
+              <div class="result-meta" id="ep_stream_meta_${i}"></div>
+            `;
+            container.appendChild(card);
+          }
+          
+          // 使用 FormData 上传图片
+          const formData = new FormData();
+          formData.append('input', input);
+          if (api_key) formData.append('api_key', api_key);
+          if (model) formData.append('model', model);
+          if (system_prompt) formData.append('system_prompt', system_prompt);
+          formData.append('thinking_mode', thinking_mode);
+          formData.append('reasoning_effort', reasoning_effort);
+          formData.append('image', uploadedImage);
+          formData.append('run_count', run_count);
+          formData.append('temperature', temperature);
+          formData.append('top_p', top_p);
+          formData.append('max_tokens', max_tokens);
+          
+          try {
+            const response = await fetch('/api/ep_chat_with_image', {
+              method: 'POST',
+              body: formData
+            });
+            
+            if (response.ok) {
+              // 处理流式响应
+              const reader = response.body.getReader();
+              const decoder = new TextDecoder('utf-8');
+              let buffer = '';
+              const lastUpdateMs = Array(run_count).fill(0); // 每路独立节流
+              
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                
+                buffer += decoder.decode(value, { stream: true });
+                let newlineIndex;
+                
+                // 处理每个完整的 SSE 事件
+                while ((newlineIndex = buffer.indexOf('\n\n')) !== -1) {
+                  const eventData = buffer.substring(0, newlineIndex);
+                  buffer = buffer.substring(newlineIndex + 2);
+                  
+                  const dataStart = eventData.indexOf('data: ');
+                  if (dataStart === -1) continue;
+                  
+                  const jsonStr = eventData.substring(dataStart + 6);
+                  try {
+                    const data = JSON.parse(jsonStr);
+                    if (data.event === 'heartbeat') continue;
+                    
+                    const idx = data.run_index ?? 0;
+                    
+                    if (data.event === 'content_delta') {
+                      const now = Date.now();
+                      if (now - lastUpdateMs[idx] < 100) {
+                        continue;
+                      }
+                      lastUpdateMs[idx] = now;
+                      
+                      const cEl = document.getElementById(`ep_stream_content_${idx}`);
+                      const rBox = document.getElementById(`ep_stream_reasoning_${idx}`);
+                      const rEl = document.getElementById(`ep_stream_reasoning_md_${idx}`);
+                      
+                      if (cEl && data.content) cEl.innerHTML = markdownToHtml(data.content);
+                      
+                      if (data.reasoning_content && thinking_mode !== 'disabled') {
+                        if (rBox) rBox.style.display = '';
+                        if (rEl) rEl.innerHTML = markdownToHtml(data.reasoning_content);
+                      }
+                    } else if (data.event === 'final') {
+                      const cEl = document.getElementById(`ep_stream_content_${idx}`);
+                      const rBox = document.getElementById(`ep_stream_reasoning_${idx}`);
+                      const rEl = document.getElementById(`ep_stream_reasoning_md_${idx}`);
+                      
+                      if (cEl && data.content) cEl.innerHTML = markdownToHtml(data.content);
+                      
+                      if (data.reasoning_content && thinking_mode !== 'disabled') {
+                        if (rBox) rBox.style.display = '';
+                        if (rEl) rEl.innerHTML = markdownToHtml(data.reasoning_content);
+                      }
+                      
+                      const meta = [];
+                      if (data.id) meta.push(`<span class="meta-pill">ID: ${data.id}</span>`);
+                      const u = data.usage || {};
+                      if (u.prompt_tokens || u.completion_tokens || u.total_tokens) {
+                        meta.push(`<span class="meta-pill">Prompt: ${u.prompt_tokens ?? 'N/A'}</span>`);
+                        meta.push(`<span class="meta-pill">Completion: ${u.completion_tokens ?? 'N/A'}</span>`);
+                        meta.push(`<span class="meta-pill">Total: ${u.total_tokens ?? 'N/A'}</span>`);
+                      }
+                      if (typeof data.first_token_time === 'number') {
+                        meta.push(`<span class="meta-pill">TTFT: ${data.first_token_time.toFixed(2)}s</span>`);
+                      }
+                      if (typeof data.total_time === 'number') {
+                        meta.push(`<span class="meta-pill">耗时 ${data.total_time.toFixed(2)}s</span>`);
+                      }
+                      const mEl = document.getElementById(`ep_stream_meta_${idx}`);
+                      if (mEl) mEl.innerHTML = meta.join(' ');
+                      
+                    } else if (data.event === 'error') {
+                       showToast(`运行 ${idx+1} 发生错误：` + (data.message || ''), 'error');
+                    }
+                  } catch (e) {
+                    console.error('JSON解析错误:', e);
+                  }
+                }
+              }
+              
+              ok = true;
+              data = {streaming: true};
+              showToast('处理完成', 'success');
+            } else {
+              const errorData = await response.json();
+              container.innerHTML = `错误：<pre>${JSON.stringify(errorData, null, 2)}</pre>`;
+              showToast('请求失败', 'error');
+              ok = false;
+            }
+          } catch (error) {
+            console.error('请求失败:', error);
+            container.innerHTML = `请求失败：${error.message}`;
+            showToast('请求失败', 'error');
+            ok = false;
+          }
+          
+        } else {
+          // 没有图片，使用原有的请求方式
+          const payload = {
+            input: input,
+            api_key: api_key,
+            model: model,
+            system_prompt: system_prompt,
+            thinking_mode: thinking_mode,
+            reasoning_effort: reasoning_effort,
+            run_count: run_count,
+            temperature: temperature,
+            top_p: top_p,
+            max_tokens: max_tokens,
+          };
+          
+          if (streaming && run_count === 1) {
+            // 使用 SSE
+            const params = new URLSearchParams({
+              input: input || '',
+              api_key: api_key || '',
+              model: model || '',
+              system_prompt: system_prompt || '',
+              thinking_mode: thinking_mode,
+              reasoning_effort: reasoning_effort,
+              temperature: temperature,
+              top_p: top_p,
+              max_tokens: max_tokens,
+            });
+            startEpStreaming(params);
+            ok = true; data = {streaming: true};
+          } else if (streaming && run_count > 1) {
+            // 多路并发 SSE 聚合
+            const params = new URLSearchParams({
+              input: input || '',
+              api_key: api_key || '',
+              model: model || '',
+              system_prompt: system_prompt || '',
+              thinking_mode: thinking_mode,
+              reasoning_effort: reasoning_effort,
+              run_count: String(run_count),
+              temperature: temperature,
+              top_p: top_p,
+              max_tokens: max_tokens,
+            });
+            startEpStreamingMulti(params, run_count);
+            ok = true; data = {streaming: true};
+          } else {
+            ({ ok, data } = await postJSON('/api/ep_chat', payload));
+          }
+        }
+        btn.disabled = false;
+        btn.textContent = old;
+        // 仅非图片请求执行以下逻辑
+        if (!uploadedImage) {
+          // 仅非流式输出清空容器
+          if (!ok || !data.streaming) {
+            container.innerHTML = '';
+          }
+          if (ok && data && Array.isArray(data.results)) {
+            showToast('处理完成', 'success');
+            const needNumbering = data.results.length > 2;
+            data.results.forEach((r, idx) => {
+              const contentHTML = `<div class="md-content">${markdownToHtml(r.content || '')}</div>`;
+              // 只有在thinking_mode不为disabled时才显示思考过程
+              const reasoningHTML = (r.reasoning_content && payload.thinking_mode !== 'disabled') ? 
+                `<div class="reasoning-box"><div class="reasoning-title">思考过程</div><div class="md-content">${markdownToHtml(r.reasoning_content || '')}</div></div>` : '';
+              const usage = r.usage || {};
+              const metaHTML = `
+                <div class="result-meta">
+                  ${r.id ? `<span class="meta-pill">ID: ${r.id}</span>` : ''}
+                  ${(usage.prompt_tokens || usage.completion_tokens || usage.total_tokens) ? `
+                    <span class="meta-pill">Prompt: ${usage.prompt_tokens ?? 'N/A'}</span>
+                    <span class="meta-pill">Completion: ${usage.completion_tokens ?? 'N/A'}</span>
+                    <span class="meta-pill">Total: ${usage.total_tokens ?? 'N/A'}</span>
+                  ` : ''}
+                </div>
+              `;
+              const card = document.createElement('div');
+              card.className = 'result-card';
+              card.innerHTML = `
+                <div class="result-main">
+                  <div class="final-answer-title">${needNumbering ? `问题 ${idx+1}: ${input}` : `问题: ${input}`}</div>
+                  ${reasoningHTML}
+                  ${contentHTML}
+                </div>
+                ${metaHTML}
+              `;
+              container.appendChild(card);
+              
+              // 保存非流式结果到epBatchResults
+              epBatchResults.push({
+                id: r.id || '',
+                question: input || '',
+                content: r.content || '',
+                reasoning: r.reasoning_content || '',
+                system_prompt: system_prompt || '',
+                usage: r.usage || {},
+                total_time: r.total_time || 0,
+                first_token_time: r.first_token_time || 0,
+                model: model || '',
+                thinking_mode: thinking_mode || '',
+                temperature: temperature || 0,
+                top_p: top_p || 0,
+                max_tokens: max_tokens || 0
+              });
+            });
+          } else if (!ok || !data.streaming) {
+            document.getElementById('ep_output').style.display = 'block';
+            document.getElementById('ep_output').textContent = `错误：
+${JSON.stringify(data, null, 2)}`;
+          }
+        }
+      });
+
+      // 保存当前运行的 SSE 连接
+      let currentEs = null;
+      let currentEsMulti = null;
+      let currentNqEs = null;
+      let currentNqEsMulti = null;
+      
+      // 保存批量处理的结果
+      let epBatchResults = [];
+      let nqBatchResults = [];
+      
+      // 文件导入处理 - 已在DOMContentLoaded事件中定义
+      
+      // 解析Excel或CSV文件
+      async function parseExcelOrCSV(file) {
+        return new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          
+          reader.onload = async (e) => {
+            try {
+              const data = new Uint8Array(e.target.result);
+              const workbook = XLSX.read(data, { type: 'array' });
+              const firstSheetName = workbook.SheetNames[0];
+              const worksheet = workbook.Sheets[firstSheetName];
+              
+              // 读取为二维数组，第一列作为问题文本，第二列作为参考图片相关内容
+              const rows = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
+              
+              if (rows.length === 0) {
+                reject(new Error('文件内容为空'));
+                return;
+              }
+              
+              // 提取问题列表，使用第一列作为问题文本，第二列作为参考图片相关内容，跳过第一行（表头）
+              const questions = [];
+              for (let i = 1; i < rows.length; i++) {
+                const row = rows[i];
+                // 确保row[0]存在且不为空
+                const questionText = row[0]?.toString().trim() || '';
+                if (!questionText) continue; // 跳过空问题
+                
+                let imageData = null;
+                let imageType = null;
+                
+                if (row[1]) {
+                  const cellValue = row[1].toString().trim();
+                  
+                  // 检查是否是base64字符串
+                  if (cellValue.startsWith('data:image/')) {
+                    imageData = cellValue;
+                    imageType = 'base64';
+                  } else if (cellValue.startsWith('base64,')) {
+                    // 不完整的base64，添加前缀
+                    imageData = 'data:image/jpeg;' + cellValue;
+                    imageType = 'base64';
+                  } else if (cellValue.match(/\.(jpg|jpeg|png|gif|bmp|webp)$/i)) {
+                    // 可能是本地文件路径
+                    try {
+                      // 尝试读取本地文件并转换为base64
+                      const localImage = await convertLocalImageToBase64(cellValue);
+                      if (localImage) {
+                        imageData = localImage;
+                        imageType = 'base64';
+                      } else {
+                        // 可能是URL
+                        imageData = cellValue;
+                        imageType = 'url';
+                      }
+                    } catch (e) {
+                      // 读取本地文件失败，视为URL
+                      imageData = cellValue;
+                      imageType = 'url';
+                    }
+                  } else {
+                    // 默认视为URL
+                    imageData = cellValue;
+                    imageType = 'url';
+                  }
+                }
+                
+                questions.push({
+                  id: i,
+                  question: questionText,
+                  image_url: imageType === 'url' ? imageData : null,
+                  image_base64: imageType === 'base64' ? imageData : null
+                });
+              }
+              
+              if (questions.length === 0) {
+                reject(new Error('未找到有效的问题，请确保文件第一列包含问题内容'));
+                return;
+              }
+              
+              resolve(questions);
+            } catch (error) {
+              reject(new Error('文件解析失败: ' + error.message));
+            }
+          };
+          
+          reader.onerror = () => {
+            reject(new Error('文件读取失败'));
+          };
+          
+          reader.readAsArrayBuffer(file);
+        });
+      }
+      
+      // 辅助函数：将本地图片文件转换为base64
+      async function convertLocalImageToBase64(filePath) {
+        return new Promise((resolve, reject) => {
+          // 注意：由于浏览器安全限制，无法直接读取本地文件系统的文件
+          // 这里只能处理通过input[type=file]选择的文件
+          // 对于文件路径，我们尝试作为URL处理
+          resolve(null);
+        });
+      }
+
+      // 显示问题清单函数
+      function displayQuestionList(questions, containerId = 'ep_question_list') {
+        const container = document.getElementById(containerId);
+        if (!container) return;
+        
+        container.innerHTML = '';
+        
+        if (questions.length === 0) {
+          container.innerHTML = '<div class="no-questions">没有解析到问题</div>';
+          return;
+        }
+        
+        // 显示容器
+        container.style.display = 'block';
+        
+        // 创建代码块样式的问题列表
+        const codeBlock = document.createElement('div');
+        codeBlock.className = 'question-code-block';
+        codeBlock.style.cssText = 'background: #0b1220; border: 1px solid #1f2937; border-radius: 6px; padding: 12px; font-family: monospace; font-size: 0.85em; max-height: 200px; overflow-y: auto; margin-bottom: 10px;';
+        
+        // 确定要显示的项目
+        const displayItems = [];
+        if (questions.length <= 5) {
+          // 5行或以下，全部显示
+          displayItems.push(...questions);
+        } else {
+          // 超过5行，显示前5行 + 省略号 + 最后一行
+          displayItems.push(...questions.slice(0, 5));
+          displayItems.push({ id: 'ellipsis', question: '...' }); // 省略号占位符
+          displayItems.push(questions[questions.length - 1]);
+        }
+        
+        // 创建列表项
+        displayItems.forEach(item => {
+          const lineDiv = document.createElement('div');
+          lineDiv.style.cssText = 'margin-bottom: 4px; line-height: 1.3;';
+          
+          if (item.id === 'ellipsis') {
+            lineDiv.innerHTML = `<span style="color: #93c5fd;">${item.question}</span>`;
+          } else {
+            if (item.image_url) {
+              lineDiv.innerHTML = `<span style="color: #60a5fa;">${item.id}.</span> <span style="color: #e2e8f0;">${item.question}</span> <span style="color: #9ca3af;">[图生图: ${item.image_url}]</span>`;
+            } else {
+              lineDiv.innerHTML = `<span style="color: #60a5fa;">${item.id}.</span> <span style="color: #e2e8f0;">${item.question}</span>`;
+            }
+          }
+          
+          codeBlock.appendChild(lineDiv);
+        });
+        
+        // 添加总数量信息（小字显示）
+        const countDiv = document.createElement('div');
+        countDiv.style.cssText = 'font-size: 0.8em; color: #93c5fd; text-align: left; margin-top: 8px;';
+        countDiv.textContent = `共 ${questions.length} 个问题`;
+        
+        container.appendChild(codeBlock);
+        container.appendChild(countDiv);
+      }
+
+      // 显示联网问答问题清单函数
+      function displayNqQuestionList(questions) {
+        const container = document.getElementById('nq_question_list');
+        if (!container) return;
+        
+        container.innerHTML = '';
+        
+        if (questions.length === 0) {
+          container.innerHTML = '<div class="no-questions">没有解析到问题</div>';
+          return;
+        }
+        
+        // 显示容器
+        container.style.display = 'block';
+        
+        // 创建代码块样式的问题列表
+        const codeBlock = document.createElement('div');
+        codeBlock.className = 'question-code-block';
+        codeBlock.style.cssText = 'background: #0b1220; border: 1px solid #1f2937; border-radius: 6px; padding: 12px; font-family: monospace; font-size: 0.85em; max-height: 200px; overflow-y: auto; margin-bottom: 10px;';
+        
+        // 确定要显示的项目
+        const displayItems = [];
+        if (questions.length <= 5) {
+          // 5行或以下，全部显示
+          displayItems.push(...questions);
+        } else {
+          // 超过5行，显示前5行 + 省略号 + 最后一行
+          displayItems.push(...questions.slice(0, 5));
+          displayItems.push({ id: 'ellipsis', question: '...' }); // 省略号占位符
+          displayItems.push(questions[questions.length - 1]);
+        }
+        
+        // 创建列表项
+        displayItems.forEach(item => {
+          const lineDiv = document.createElement('div');
+          lineDiv.style.cssText = 'margin-bottom: 4px; line-height: 1.3;';
+          
+          if (item.id === 'ellipsis') {
+            lineDiv.innerHTML = `<span style="color: #93c5fd;">${item.question}</span>`;
+          } else {
+            lineDiv.innerHTML = `<span style="color: #60a5fa;">${item.id}.</span> <span style="color: #e2e8f0;">${item.question}</span>`;
+          }
+          
+          codeBlock.appendChild(lineDiv);
+        });
+        
+        // 添加总数量信息（小字显示）
+        const countDiv = document.createElement('div');
+        countDiv.style.cssText = 'font-size: 0.8em; color: #93c5fd; text-align: left; margin-top: 8px;';
+        countDiv.textContent = `共 ${questions.length} 个问题`;
+        
+        container.appendChild(codeBlock);
+        container.appendChild(countDiv);
+      }
+
+      // 下载结果功能
+      document.getElementById('ep_download_results').addEventListener('click', async () => {
+        if (epBatchResults.length === 0) {
+          showToast('没有可下载的结果', 'warning');
+          return;
+        }
+        
+        const exportFormat = 'csv';
+        
+        try {
+          const response = await fetch('/api/export_results', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              results: epBatchResults,
+              format: exportFormat,
+              type: 'ep'
+            })
+          });
+          
+          if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || '导出失败');
+          }
+          
+          const blob = await response.blob();
+          const url = window.URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          
+          const timestamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '');
+          a.download = `doubao_batch_results_${timestamp}.csv`;
+          
+          document.body.appendChild(a);
+          a.click();
+          window.URL.revokeObjectURL(url);
+          document.body.removeChild(a);
+          
+          showToast('结果下载成功', 'success');
+        } catch (error) {
+          showToast('下载失败: ' + error.message, 'error');
+        }
+      });
+
+      // 联网问答下载结果功能
+      document.getElementById('nq_download_results').addEventListener('click', async () => {
+        if (nqBatchResults.length === 0) {
+          showToast('没有可下载的结果', 'warning');
+          return;
+        }
+        
+        const exportFormat = 'csv';
+        
+        try {
+          const response = await fetch('/api/export_results', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              results: nqBatchResults,
+              format: exportFormat,
+              type: 'network_qa'
+            })
+          });
+          
+          if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || '导出失败');
+          }
+          
+          const blob = await response.blob();
+          const url = window.URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          
+          const timestamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '');
+          a.download = `doubao_batch_results_${timestamp}.csv`;
+          
+          document.body.appendChild(a);
+          a.click();
+          window.URL.revokeObjectURL(url);
+          document.body.removeChild(a);
+          
+          showToast('结果下载成功', 'success');
+        } catch (error) {
+          showToast('下载失败: ' + error.message, 'error');
+        }
+      });
+
+      // EP 流式输出（SSE）
+      function startEpStreaming(params) {
+        const container = document.getElementById('ep_results');
+        container.innerHTML = '';
+        const inputText = params.get('input') || '';
+        const card = document.createElement('div');
+        card.className = 'result-card';
+        card.innerHTML = `
+          <div class="result-main">
+            <div class="final-answer-title">问题: ${inputText}</div>
+            <div id="ep_stream_reasoning" class="reasoning-box" style="display:none;">
+              <div class="reasoning-title">思考过程</div>
+              <div class="md-content" id="ep_stream_reasoning_md"></div>
+            </div>
+            <div id="ep_stream_content" class="md-content"></div>
+          </div>
+          <div class="result-meta" id="ep_stream_meta"></div>
+        `;
+        container.appendChild(card);
+
+        const url = `/api/ep_chat_stream?${params.toString()}`;
+        const es = new EventSource(url);
+        currentEs = es; // 保存当前 SSE 连接
+        let lastUpdateMs = 0; // 简单节流，避免频繁完整markdown渲染导致卡顿
+        es.onmessage = (e) => {
+          try {
+            const data = JSON.parse(e.data);
+            if (data.event === 'content_delta') {
+              const now = Date.now();
+              if (now - lastUpdateMs < 100) {
+                return; // 100ms内跳过增量渲染，最终内容仍会显示
+              }
+              lastUpdateMs = now;
+              // 仅当有新内容时更新，避免思考过程中清空内容
+              if (data.content) {
+                document.getElementById('ep_stream_content').innerHTML = markdownToHtml(data.content || '');
+              }
+              // 只有在thinking_mode不为disabled时才显示思考过程
+              if (data.reasoning_content && params.get('thinking_mode') !== 'disabled') {
+                document.getElementById('ep_stream_reasoning').style.display = '';
+                document.getElementById('ep_stream_reasoning_md').innerHTML = markdownToHtml(data.reasoning_content || '');
+              }
+            } else if (data.event === 'final') {
+              // 在最终事件时强制渲染完整内容，避免因节流导致尾部丢失
+              if (data.content) {
+                document.getElementById('ep_stream_content').innerHTML = markdownToHtml(data.content || '');
+              }
+              if (data.reasoning_content && params.get('thinking_mode') !== 'disabled') {
+                document.getElementById('ep_stream_reasoning').style.display = '';
+                document.getElementById('ep_stream_reasoning_md').innerHTML = markdownToHtml(data.reasoning_content || '');
+              }
+              const meta = [];
+              if (data.id) meta.push(`<span class="meta-pill">ID: ${data.id}</span>`);
+              const u = data.usage || {};
+              if (u.prompt_tokens || u.completion_tokens || u.total_tokens) {
+                meta.push(`<span class="meta-pill">Prompt: ${u.prompt_tokens ?? 'N/A'}</span>`);
+                meta.push(`<span class="meta-pill">Completion: ${u.completion_tokens ?? 'N/A'}</span>`);
+                meta.push(`<span class="meta-pill">Total: ${u.total_tokens ?? 'N/A'}</span>`);
+              }
+              if (typeof data.first_token_time === 'number') {
+                meta.push(`<span class="meta-pill">TTFT: ${data.first_token_time.toFixed(2)}s</span>`);
+              }
+              if (typeof data.total_time === 'number') {
+                meta.push(`<span class="meta-pill">耗时 ${data.total_time.toFixed(2)}s</span>`);
+              }
+              document.getElementById('ep_stream_meta').innerHTML = meta.join(' ');
+              
+              // 保存单问结果到epBatchResults
+              epBatchResults.push({
+                id: data.id || '',
+                question: inputText || '',
+                content: data.content || '',
+                reasoning: data.reasoning_content || '',
+                system_prompt: params.get('system_prompt') || '',
+                usage: data.usage || {},
+                total_time: data.total_time || 0,
+                first_token_time: data.first_token_time || 0,
+                model: params.get('model') || '',
+                thinking_mode: params.get('thinking_mode') || '',
+                temperature: params.get('temperature') || 0,
+                top_p: params.get('top_p') || 0,
+                max_tokens: params.get('max_tokens') || 0
+              });
+              
+              es.close();
+              showToast('处理完成', 'success');
+            } else if (data.event === 'error') {
+              es.close();
+              showToast('发生错误：' + (data.message || ''), 'error');
+            }
+          } catch (err) {
+            // ignore parse errors
+          }
+        };
+        es.onerror = () => {
+          es.close();
+        };
+      }
+
+      // 多路并发流式输出（聚合）：为每个 run_index 创建独立卡片并增量更新
+      function startEpStreamingMulti(params, runCount) {
+        const container = document.getElementById('ep_results');
+        container.innerHTML = '';
+        const inputText = params.get('input') || '';
+        for (let i = 0; i < runCount; i++) {
+          const card = document.createElement('div');
+          card.className = 'result-card';
+          card.innerHTML = `
+            <div class="result-main">
+              <div class="final-answer-title">问题 ${i+1}: ${inputText}</div>
+              <div class="reasoning-box" id="ep_stream_reasoning_${i}" style="display:none;">
+                <div class="reasoning-title">思考过程</div>
+                <div class="md-content" id="ep_stream_reasoning_md_${i}"></div>
+              </div>
+              <div class="md-content" id="ep_stream_content_${i}"></div>
+            </div>
+            <div class="result-meta" id="ep_stream_meta_${i}"></div>
+          `;
+          container.appendChild(card);
+        }
+
+        const url = `/api/ep_chat_stream_multi?${params.toString()}`;
+        const es = new EventSource(url);
+        currentEsMulti = es; // 保存当前多路 SSE 连接
+        const lastUpdateMs = Array(runCount).fill(0); // 每路独立节流
+        es.onmessage = (e) => {
+          try {
+            const data = JSON.parse(e.data);
+            if (data.event === 'heartbeat') return;
+            const idx = data.run_index ?? 0;
+            if (data.event === 'content_delta') {
+              const now = Date.now();
+              if (now - lastUpdateMs[idx] < 100) {
+                return;
+              }
+              lastUpdateMs[idx] = now;
+              const cEl = document.getElementById(`ep_stream_content_${idx}`);
+              const rBox = document.getElementById(`ep_stream_reasoning_${idx}`);
+              const rEl = document.getElementById(`ep_stream_reasoning_md_${idx}`);
+              if (cEl) cEl.innerHTML = markdownToHtml(data.content || '');
+              // 只有在thinking_mode不为disabled时才显示思考过程
+              if (data.reasoning_content && params.get('thinking_mode') !== 'disabled') {
+                if (rBox) rBox.style.display = '';
+                if (rEl) rEl.innerHTML = markdownToHtml(data.reasoning_content || '');
+              }
+            } else if (data.event === 'final') {
+              // 在最终事件时强制渲染完整内容，避免因节流导致尾部丢失
+              const cEl = document.getElementById(`ep_stream_content_${idx}`);
+              const rBox = document.getElementById(`ep_stream_reasoning_${idx}`);
+              const rEl = document.getElementById(`ep_stream_reasoning_md_${idx}`);
+              if (cEl) cEl.innerHTML = markdownToHtml(data.content || '');
+              if (data.reasoning_content && params.get('thinking_mode') !== 'disabled') {
+                if (rBox) rBox.style.display = '';
+                if (rEl) rEl.innerHTML = markdownToHtml(data.reasoning_content || '');
+              }
+              const meta = [];
+              if (data.id) meta.push(`<span class="meta-pill">ID: ${data.id}</span>`);
+              const u = data.usage || {};
+              if (u.prompt_tokens || u.completion_tokens || u.total_tokens) {
+                meta.push(`<span class="meta-pill">Prompt: ${u.prompt_tokens ?? 'N/A'}</span>`);
+                meta.push(`<span class="meta-pill">Completion: ${u.completion_tokens ?? 'N/A'}</span>`);
+                meta.push(`<span class="meta-pill">Total: ${u.total_tokens ?? 'N/A'}</span>`);
+              }
+              if (typeof data.first_token_time === 'number') {
+                meta.push(`<span class="meta-pill">TTFT: ${data.first_token_time.toFixed(2)}s</span>`);
+              }
+              if (typeof data.total_time === 'number') {
+                meta.push(`<span class="meta-pill">耗时 ${data.total_time.toFixed(2)}s</span>`);
+              }
+              const mEl = document.getElementById(`ep_stream_meta_${idx}`);
+              if (mEl) mEl.innerHTML = meta.join(' ');
+              
+              // 保存多路并发结果到epBatchResults
+              epBatchResults.push({
+                id: data.id || '',
+                question: inputText || '',
+                content: data.content || '',
+                reasoning: data.reasoning_content || '',
+                system_prompt: params.get('system_prompt') || '',
+                usage: data.usage || {},
+                total_time: data.total_time || 0,
+                first_token_time: data.first_token_time || 0,
+                run_index: idx,
+                model: params.get('model') || '',
+                thinking_mode: params.get('thinking_mode') || '',
+                temperature: params.get('temperature') || 0,
+                top_p: params.get('top_p') || 0,
+                max_tokens: params.get('max_tokens') || 0
+              });
+            } else if (data.event === 'error') {
+              showToast(`运行 ${idx+1} 发生错误：` + (data.message || ''), 'error');
+            }
+          } catch (err) {
+            // ignore parse errors
+          }
+        };
+        es.onerror = () => {
+          es.close();
+          showToast('流式连接已关闭', 'info');
+        };
+      }
+
+      // 联网问答流式输出（SSE）
+      function startNqStreaming(params) {
+        const container = document.getElementById('nq_results');
+        container.innerHTML = '';
+        const card = document.createElement('div');
+        card.className = 'result-card';
+        // 查找thinking模式
+        const thinking_mode = params.get('thinking') || 'false';
+        // 从params中获取问题内容
+        const input = params.get('input') || '';
+        // 如果启用了思考模式，添加思考过程容器
+        if (thinking_mode === 'thinking' || thinking_mode === 'auto_thinking') {
+          card.innerHTML = `
+            <div class="result-main">
+              <div class="reasoning-box"><div class="reasoning-title">思考过程</div><div id="nq_stream_reasoning_md" class="md-content"></div></div>
+              <div class="final-answer-title">问题: ${input}</div>
+              <div id="nq_stream_content" class="md-content"></div>
+            </div>
+            <div class="result-meta" id="nq_stream_meta"></div>
+          `;
+        } else {
+          card.innerHTML = `
+            <div class="result-main">
+              <div class="final-answer-title">问题: ${input}</div>
+              <div id="nq_stream_content" class="md-content"></div>
+            </div>
+            <div class="result-meta" id="nq_stream_meta"></div>
+          `;
+        }
+        container.appendChild(card);
+
+        const url = `/api/network_qa_chat_stream?${params.toString()}`;
+        const es = new EventSource(url);
+        currentNqEs = es;
+        let lastUpdateMs = 0;
+        let accumulatedContent = '';
+        let accumulatedReasoning = '';
+
+        // 显示初始状态
+        document.getElementById('nq_stream_content').innerHTML = '<div style="color: #93c5fd;">正在处理中...</div>';
+        if (document.getElementById('nq_stream_reasoning_md')) {
+          document.getElementById('nq_stream_reasoning_md').innerHTML = '<div style="color: #93c5fd;">思考中...</div>';
+        }
+
+        es.onmessage = (e) => {
+          try {
+            const data = JSON.parse(e.data);
+            if (data.event === 'content_delta') {
+              const now = Date.now();
+              if (now - lastUpdateMs < 30) return; // 进一步减少防抖时间到30ms
+              lastUpdateMs = now;
+              
+              // 处理增量内容：如果新内容比累积内容长，说明是累积内容；否则是增量内容
+              if (data.content) {
+                if (data.content.length > accumulatedContent.length) {
+                  // 累积内容，直接使用
+                  accumulatedContent = data.content;
+                } else {
+                  // 增量内容，说明后端返回的是增量，需要追加
+                  accumulatedContent += data.content;
+                }
+                document.getElementById('nq_stream_content').innerHTML = markdownToHtml(accumulatedContent || '');
+              }
+              
+              if (data.reasoning_content) {
+                if (data.reasoning_content.length > accumulatedReasoning.length) {
+                  // 累积内容，直接使用
+                  accumulatedReasoning = data.reasoning_content;
+                } else {
+                  // 增量内容，说明后端返回的是增量，需要追加
+                  accumulatedReasoning += data.reasoning_content;
+                }
+                document.getElementById('nq_stream_reasoning_md').innerHTML = markdownToHtml(accumulatedReasoning || '');
+              }
+            } else if (data.event === 'final') {
+              if (data.content) {
+                document.getElementById('nq_stream_content').innerHTML = markdownToHtml(data.content || '');
+              }
+              if (data.reasoning_content) {
+                document.getElementById('nq_stream_reasoning_md').innerHTML = markdownToHtml(data.reasoning_content || '');
+              }
+              const meta = [];
+              if (data.id) meta.push(`<span class="meta-pill">ID: ${data.id}</span>`);
+              const u = data.usage || {};
+              if (u.prompt_tokens || u.completion_tokens || u.total_tokens) {
+                meta.push(`<span class="meta-pill">Prompt: ${u.prompt_tokens ?? 'N/A'}</span>`);
+                meta.push(`<span class="meta-pill">Completion: ${u.completion_tokens ?? 'N/A'}</span>`);
+                meta.push(`<span class="meta-pill">Total: ${u.total_tokens ?? 'N/A'}</span>`);
+              }
+              if (typeof data.first_token_time === 'number') {
+                meta.push(`<span class="meta-pill">TTFT: ${data.first_token_time.toFixed(2)}s</span>`);
+              }
+              if (typeof data.total_time === 'number') {
+                meta.push(`<span class="meta-pill">耗时 ${data.total_time.toFixed(2)}s</span>`);
+              }
+              document.getElementById('nq_stream_meta').innerHTML = meta.join(' ');
+              
+              // 保存结果
+              nqBatchResults.push({
+                id: data.id || '',
+                question: input || '',
+                content: data.content || '',
+                system_prompt: params.get('system_prompt') || '',
+                usage: data.usage || {},
+                first_token_time: data.first_token_time || 0,
+                total_time: data.total_time || 0,
+                thinking: params.get('thinking') || ''
+              });
+              
+              // 显示导出容器
+              document.getElementById('nq_export_container').style.display = 'block';
+              
+              es.close();
+              showToast('处理完成', 'success');
+            } else if (data.event === 'error') {
+              es.close();
+              showToast('发生错误：' + (data.message || ''), 'error');
+            }
+          } catch (err) { }
+        };
+        es.onerror = () => { es.close(); };
+      }
+
+      // 联网问答多路并发流式输出
+      function startNqStreamingMulti(params, runCount, thinking) {
+        nqBatchResults = [];
+        const container = document.getElementById('nq_results');
+        container.innerHTML = '';
+        
+        // 隐藏导出容器
+        document.getElementById('nq_export_container').style.display = 'none';
+        for (let i = 0; i < runCount; i++) {
+          const card = document.createElement('div');
+          card.className = 'result-card';
+          let cardHtml = `
+            <div class="result-main">
+              <div class="final-answer-title">回答 ${i+1}</div>
+          `;
+          // 如果是思考模式或自动思考模式，添加思考过程容器
+          if (thinking === 'thinking' || thinking === 'auto_thinking') {
+            cardHtml += `
+              <div class="thinking-section">
+                <div class="thinking-title">思考过程</div>
+                <div class="reasoning-box">
+                  <div class="md-content" id="nq_stream_reasoning_${i}"></div>
+                </div>
+              </div>
+            `;
+          }
+          cardHtml += `
+              <div class="md-content" id="nq_stream_content_${i}"></div>
+            </div>
+            <div class="result-meta" id="nq_stream_meta_${i}"></div>
+          `;
+          card.innerHTML = cardHtml;
+          container.appendChild(card);
+        }
+
+        const url = `/api/network_qa_chat_stream_multi?${params.toString()}`;
+        const es = new EventSource(url);
+        currentNqEsMulti = es;
+        const lastUpdateMs = Array(runCount).fill(0);
+
+        // 显示所有运行实例的初始状态
+        const accumulatedContents = Array(runCount).fill('');
+        const accumulatedReasonings = Array(runCount).fill('');
+        
+        for (let i = 0; i < runCount; i++) {
+          const cEl = document.getElementById(`nq_stream_content_${i}`);
+          if (cEl) cEl.innerHTML = '<div style="color: #93c5fd;">正在处理中...</div>';
+          
+          const rEl = document.getElementById(`nq_stream_reasoning_${i}`);
+          if (rEl) rEl.innerHTML = '<div style="color: #93c5fd;">思考中...</div>';
+        }
+
+        es.onmessage = (e) => {
+          try {
+            const data = JSON.parse(e.data);
+            if (data.event === 'heartbeat') return;
+            const idx = data.run_index ?? 0;
+
+            if (data.event === 'content_delta') {
+              const now = Date.now();
+              if (now - lastUpdateMs[idx] < 30) return; // 进一步减少防抖时间到30ms
+              lastUpdateMs[idx] = now;
+              
+              // 处理增量内容：如果新内容比累积内容长，说明是累积内容；否则是增量内容
+              if (data.content) {
+                if (data.content.length > accumulatedContents[idx].length) {
+                  // 累积内容，直接使用
+                  accumulatedContents[idx] = data.content;
+                } else {
+                  // 增量内容，说明后端返回的是增量，需要追加
+                  accumulatedContents[idx] += data.content;
+                }
+                const cEl = document.getElementById(`nq_stream_content_${idx}`);
+                if (cEl) cEl.innerHTML = markdownToHtml(accumulatedContents[idx] || '');
+              }
+              
+              // 更新思考内容
+              if (data.reasoning_content) {
+                if (data.reasoning_content.length > accumulatedReasonings[idx].length) {
+                  // 累积内容，直接使用
+                  accumulatedReasonings[idx] = data.reasoning_content;
+                } else {
+                  // 增量内容，说明后端返回的是增量，需要追加
+                  accumulatedReasonings[idx] += data.reasoning_content;
+                }
+                const rEl = document.getElementById(`nq_stream_reasoning_${idx}`);
+                if (rEl) rEl.innerHTML = markdownToHtml(accumulatedReasonings[idx] || '');
+              }
+            } else if (data.event === 'final') {
+              const cEl = document.getElementById(`nq_stream_content_${idx}`);
+              if (cEl) cEl.innerHTML = markdownToHtml(data.content || '');
+              // 更新思考内容
+              if (data.reasoning_content) {
+                const rEl = document.getElementById(`nq_stream_reasoning_${idx}`);
+                if (rEl) rEl.innerHTML = markdownToHtml(data.reasoning_content || '');
+              }
+              
+              const meta = [];
+              if (data.id) meta.push(`<span class="meta-pill">ID: ${data.id}</span>`);
+              const u = data.usage || {};
+              if (u.prompt_tokens || u.completion_tokens || u.total_tokens) {
+                meta.push(`<span class="meta-pill">Prompt: ${u.prompt_tokens ?? 'N/A'}</span>`);
+                meta.push(`<span class="meta-pill">Completion: ${u.completion_tokens ?? 'N/A'}</span>`);
+                meta.push(`<span class="meta-pill">Total: ${u.total_tokens ?? 'N/A'}</span>`);
+              }
+              if (typeof data.first_token_time === 'number') {
+                meta.push(`<span class="meta-pill">TTFT: ${data.first_token_time.toFixed(2)}s</span>`);
+              }
+              if (typeof data.total_time === 'number') {
+                meta.push(`<span class="meta-pill">耗时 ${data.total_time.toFixed(2)}s</span>`);
+              }
+              const mEl = document.getElementById(`nq_stream_meta_${idx}`);
+              if (mEl) mEl.innerHTML = meta.join(' ');
+              
+              // 保存结果
+              nqBatchResults.push({
+                id: data.id || '',
+                question: params.get('input') || '',
+                content: data.content || '',
+                system_prompt: params.get('system_prompt') || '',
+                usage: data.usage || {},
+                first_token_time: data.first_token_time || 0,
+                total_time: data.total_time || 0,
+                thinking: thinking || ''
+              });
+            } else if (data.event === 'error') {
+              showToast(`运行 ${idx+1} 发生错误：` + (data.message || ''), 'error');
+            }
+          } catch (err) { }
+        };
+        es.onerror = () => { es.close(); showToast('流式连接已关闭', 'info'); };
+      }
+
+      // 联网问答文件上传处理
+      document.getElementById('nq_batch_file').addEventListener('change', async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        
+        try {
+          showToast('正在解析文件...', 'info');
+          const questions = await parseExcelOrCSV(file);
+          showToast(`成功导入 ${questions.length} 个问题`, 'success');
+          // 显示问题列表（前5行和最后1行）
+          displayNqQuestionList(questions);
+          // 将解析后的问题存储在file input元素上
+          e.target.questions = questions;
+        } catch (error) {
+          showToast('文件解析失败: ' + error.message, 'error');
+          e.target.questions = null;
+        }
+      });
+
+      // 处理联网问答问题批量处理
+      function processNqQuestions(questions, system_prompt, thinking, run_count) {
+        // 关闭现有连接
+        if (currentNqEs) { currentNqEs.close(); currentNqEs = null; }
+        if (currentNqEsMulti) { currentNqEsMulti.close(); currentNqEsMulti = null; }
+        
+        document.getElementById('nq_results').innerHTML = '';
+        document.getElementById('nq_output').style.display = 'none';
+        // 隐藏下载按钮
+        document.getElementById('nq_export_container').style.display = 'none';
+
+        if (questions.length > 1) {
+          // 批量处理多个问题
+          handleNqBatchProcessing(questions, {
+            system_prompt: system_prompt || '',
+            thinking: thinking,
+            run_count: run_count
+          });
+        } else {
+          // 单个问题处理
+          const params = new URLSearchParams({
+            input: questions[0].question || '',
+            system_prompt: system_prompt || '',
+            thinking: thinking,
+          });
+
+          if (run_count > 1) {
+            params.append('run_count', run_count);
+            startNqStreamingMulti(params, run_count, thinking);
+            showToast('已提交多路请求…', 'success');
+          } else {
+            startNqStreaming(params);
+            showToast('已提交请求…', 'success');
+          }
+        }
+      }
+
+      document.getElementById('nq_submit').addEventListener('click', async (ev) => {
+        const btn = ev.currentTarget;
+        const system_prompt = document.getElementById('nq_system_prompt').value || null;
+        const thinking = document.getElementById('nq_thinking').value;
+        const run_count = parseInt(document.getElementById('nq_run_count').value || '1', 10);
+
+        btn.disabled = true; const old = btn.textContent; btn.textContent = '稍等…';
+
+        let questions = [];
+        
+        // 检查是否有文件上传
+        const batchFile = document.getElementById('nq_batch_file');
+        if (batchFile.files.length > 0 && batchFile.questions) {
+          // 使用文件上传的问题
+          questions = batchFile.questions;
+          if (questions.length === 0) {
+            showToast('文件中未找到有效问题', 'error');
+            btn.disabled = false; btn.textContent = old;
+            return;
+          }
+          processNqQuestions(questions, system_prompt, thinking, run_count);
+          
+          // 恢复按钮状态
+          setTimeout(() => {
+            btn.disabled = false; 
+            btn.textContent = old;
+          }, 1000);
+        } else {
+          // 使用文本输入
+          const input = document.getElementById('nq_input').value.trim();
+          if (!input) {
+            showToast('请输入问题', 'error');
+            btn.disabled = false; btn.textContent = old;
+            return;
+          }
+          questions = [{ id: 1, question: input }];
+          processNqQuestions(questions, system_prompt, thinking, run_count);
+          
+          // 恢复按钮状态
+          setTimeout(() => {
+            btn.disabled = false; 
+            btn.textContent = old;
+          }, 1000);
+        }
+      });
+
+      // 参考图上传和预览功能
+      const uploadedImageIds = [];
+      
+      // 输入模式切换事件
+       document.getElementById('pic_input_mode').addEventListener('change', function() {
+         const isImageToImage = this.value === 'image_to_image';
+         const uploadContainer = document.getElementById('pic_reference_upload_container');
+         const optimizeModeContainer = document.getElementById('pic_optimize_mode_container');
+         
+         if (isImageToImage) {
+           uploadContainer.style.display = 'block';
+           optimizeModeContainer.style.display = 'block';
+         } else {
+           uploadContainer.style.display = 'none';
+           optimizeModeContainer.style.display = 'none';
+           // 清空已上传的图片
+           uploadedImageIds.length = 0;
+           document.getElementById('pic_preview_container').innerHTML = '';
+           document.getElementById('pic_reference_image').value = '';
+         }
+       });
+      
+      // 图片生成提示词输入框粘贴事件
+      document.getElementById('pic_input').addEventListener('paste', async (e) => {
+        const items = e.clipboardData.items;
+        for (const item of items) {
+          if (item.type.startsWith('image/')) {
+            const file = item.getAsFile();
+            if (!file) return;
+            
+            // 切换到图生图模式
+            const inputModeSelect = document.getElementById('pic_input_mode');
+            inputModeSelect.value = 'image_to_image';
+            // 显示上传容器
+            const uploadContainer = document.getElementById('pic_reference_upload_container');
+            uploadContainer.style.display = 'block';
+            
+            // 清空之前的预览和已上传的图片
+            const previewContainer = document.getElementById('pic_preview_container');
+            previewContainer.innerHTML = '';
+            uploadedImageIds.length = 0;
+
+            // 创建预览
+            const reader = new FileReader();
+            reader.onload = function(ev) {
+              const previewDiv = document.createElement('div');
+              previewDiv.style.cssText = 'display: inline-block; margin: 5px; text-align: center;';
+              previewDiv.innerHTML = `
+                <img src="${ev.target.result}" style="max-width: 100px; max-height: 100px; object-fit: cover; border: 1px solid #ddd; border-radius: 4px;">
+                <div style="font-size: 12px; margin-top: 5px;">粘贴的图片</div>
+                <div style="font-size: 10px; color: #666;">${(file.size / 1024).toFixed(1)}KB</div>
+              `;
+              previewContainer.appendChild(previewDiv);
+            };
+            reader.readAsDataURL(file);
+
+            // 上传文件到服务器
+            try {
+              const formData = new FormData();
+              formData.append('file', file);
+              
+              const response = await fetch('/api/upload_image', {
+                method: 'POST',
+                body: formData
+              });
+              
+              if (response.ok) {
+                const result = await response.json();
+                uploadedImageIds.push(result.image_id);
+                showToast('图片粘贴并上传成功', 'success');
+              } else {
+                const error = await response.json();
+                showToast('图片上传失败: ' + error.error, 'error');
+              }
+            } catch (error) {
+              showToast('图片上传失败: ' + error.message, 'error');
+            }
+
+            break;
+          }
+        }
+      });
+      
+      // 参考图片上传事件
+      document.getElementById('pic_reference_image').addEventListener('change', async function(e) {
+        const files = e.target.files;
+        const previewContainer = document.getElementById('pic_preview_container');
+        
+        if (files.length === 0) return;
+        
+        // 清空之前的预览和已上传的图片
+        previewContainer.innerHTML = '';
+        uploadedImageIds.length = 0;
+        
+        for (let i = 0; i < files.length; i++) {
+          const file = files[i];
+          
+          // 验证文件类型
+          if (!file.type.startsWith('image/')) {
+            showToast(`文件 ${file.name} 不是图片文件`, 'error');
+            continue;
+          }
+          
+          // 验证文件大小（最大10MB）
+          if (file.size > 10 * 1024 * 1024) {
+            showToast(`文件 ${file.name} 超过10MB限制`, 'error');
+            continue;
+          }
+          
+          // 创建预览
+          const reader = new FileReader();
+          reader.onload = function(ev) {
+            const previewDiv = document.createElement('div');
+            previewDiv.style.cssText = 'display: inline-block; margin: 5px; text-align: center;';
+            previewDiv.innerHTML = `
+              <img src="${ev.target.result}" style="max-width: 100px; max-height: 100px; object-fit: cover; border: 1px solid #ddd; border-radius: 4px;">
+              <div style="font-size: 12px; margin-top: 5px;">${file.name}</div>
+              <div style="font-size: 10px; color: #666;">${(file.size / 1024).toFixed(1)}KB</div>
+            `;
+            previewContainer.appendChild(previewDiv);
+          };
+          reader.readAsDataURL(file);
+          
+          // 上传文件到服务器
+          try {
+            const formData = new FormData();
+            formData.append('file', file);
+            
+            const response = await fetch('/api/upload_image', {
+              method: 'POST',
+              body: formData
+            });
+            
+            if (response.ok) {
+              const result = await response.json();
+              uploadedImageIds.push(result.image_id);
+              showToast(`图片 ${file.name} 上传成功`, 'success');
+            } else {
+              const error = await response.json();
+              showToast(`图片 ${file.name} 上传失败: ${error.detail}`, 'error');
+            }
+          } catch (error) {
+            showToast(`图片 ${file.name} 上传失败: ${error.message}`, 'error');
+          }
+        }
+      });
+      
+       // 初始化显示优化模式容器，文生图和图生图都支持
+       document.getElementById('pic_optimize_mode_container').style.display = 'block';
+
+      // 图片生成批量处理函数
+      async function handlePictureBatchProcessing(questions, config) {
+        const container = document.getElementById('pic_output');
+        container.innerHTML = '';
+        
+        // 为每个问题创建独立的结果卡片
+        questions.forEach((question, index) => {
+          const card = document.createElement('div');
+          card.className = 'result-card';
+          card.innerHTML = `
+            <div class="result-main">
+              <div class="final-answer-title">Prompt ${index+1}: ${question.question}</div>
+              <div id="pic_batch_content_${index}" class="md-content" style="margin-top: 8px;">正在生成...</div>
+            </div>
+            <div class="result-meta" id="pic_batch_meta_${index}"></div>
+          `;
+          container.appendChild(card);
+        });
+        
+        // 构建批量请求payload
+        const payload = {
+          questions: questions,
+          model: config.model,
+          size: config.size,
+          sequential: "auto",
+          max_images: 1,
+          watermark: config.watermark,
+          response_format: config.response_format,
+          optimize_mode: config.optimize_mode,
+          // 设置输入模式：如果有任何问题包含图片URL，或者有上传的参考图片ID，则使用图生图模式
+          input_mode: questions.some(q => q.image_url) || (config.uploaded_image_ids && config.uploaded_image_ids.length > 0) ? "image_to_image" : "text_to_image"
+        };
+        
+        // 如果有上传的参考图片ID，添加到每个问题中
+        if (config.uploaded_image_ids && config.uploaded_image_ids.length > 0) {
+          payload.questions = payload.questions.map(q => ({
+            ...q,
+            uploaded_image_id: config.uploaded_image_ids[0] // 为所有问题使用第一张上传的图片
+          }));
+        }
+        
+        // 发送批量请求
+        showToast('请求已提交，正在生成图片...', 'info');
+        const { ok, data } = await postJSON('/api/picture_generate_batch', payload);
+        
+        if (!ok) {
+          throw new Error('请求提交失败: ' + (data.error || '未知错误'));
+        }
+        
+        if (data.results) {
+          // 处理批量结果
+          data.results.forEach((result, index) => {
+            const contentEl = document.getElementById(`pic_batch_content_${index}`);
+            const metaEl = document.getElementById(`pic_batch_meta_${index}`);
+            
+            if (result.success && result.result && result.result.data) {
+              // 成功生成图片
+              let imagesHTML = '';
+              result.result.data.forEach((image, imgIndex) => {
+                if (image.url) {
+                  const url = new URL(image.url);
+                  const fileName = url.pathname.split('/').pop();
+                  const imageId = fileName.split('_')[0];
+                  
+                  imagesHTML += `
+                    <div style="margin-bottom: 20px;">
+                      <img src="${image.url}" alt="生成的图片 ${imgIndex + 1}" style="max-width: 100%; max-height: 400px; margin: 10px 0;">
+                    </div>
+                  `;
+                } else if (image.b64_json) {
+                  imagesHTML += `
+                    <div style="margin-bottom: 20px;">
+                      <img src="data:image/png;base64,${image.b64_json}" alt="生成的图片 ${imgIndex + 1}" style="max-width: 100%; max-height: 400px; margin: 10px 0;">
+                    </div>
+                  `;
+                }
+              });
+              
+              if (contentEl) contentEl.innerHTML = imagesHTML;
+              
+              // 更新元信息
+              if (metaEl) {
+                let metaHTML = '';
+                if (result.result.data[0]) {
+                  const image = result.result.data[0];
+                  if (image.url) {
+                    const url = new URL(image.url);
+                    const fileName = url.pathname.split('/').pop();
+                    const imageId = fileName.split('_')[0];
+                    metaHTML += `<span class="meta-pill">尺寸: ${image.size || 'N/A'}</span>`;
+                    metaHTML += `<span class="meta-pill">ID: ${imageId}</span>`;
+                  } else if (image.b64_json) {
+                    metaHTML += `<span class="meta-pill">尺寸: ${image.size || 'N/A'}</span>`;
+                  }
+                }
+                metaHTML += `<span class="meta-pill">模型: ${result.result.model || 'N/A'}</span>`;
+                metaHTML += `<span class="meta-pill">耗时: ${result.result.generation_time || 'N/A'}秒</span>`;
+                metaEl.innerHTML = metaHTML;
+              }
+            } else {
+              // 处理失败情况
+              if (contentEl) contentEl.innerHTML = `<div style="color: #ef4444;">生成失败: ${result.error || '未知错误'}</div>`;
+              if (metaEl) metaEl.innerHTML = `<span class="meta-pill" style="background: #ef4444;">失败</span>`;
+            }
+          });
+          
+          // 显示下载按钮
+          const successCount = data.results.filter(r => r.success).length;
+          if (successCount > 0) {
+            document.getElementById('pic_download_results').style.display = 'inline-block';
+          }
+          
+          return data.results;
+        } else {
+          throw new Error('批量图片生成请求失败');
+        }
+      }
+
+      document.getElementById('pic_submit').addEventListener('click', async (ev) => {
+        const btn = ev.currentTarget;
+        const inputMode = document.getElementById('pic_input_mode').value;
+        const batchFileInput = document.getElementById('pic_batch_file');
+        const batchQuestions = batchFileInput.questions || [];
+        
+        // 检查是否是批量处理
+        const isBatchProcessing = batchQuestions.length > 0;
+        
+        if (isBatchProcessing) {
+          // 批量处理模式
+          const config = {
+            model: document.getElementById('pic_model').value || null,
+            size: document.getElementById('pic_size').value || null,
+            watermark: document.getElementById('pic_watermark').value === 'true',
+            response_format: document.getElementById('pic_response_format').value,
+            input_mode: inputMode,
+            optimize_mode: document.getElementById('pic_optimize_mode').value,
+            uploaded_image_ids: (inputMode === 'image_to_image' && uploadedImageIds.length > 0) ? uploadedImageIds : []
+          };
+          
+          btn.disabled = true;
+          const old = btn.textContent;
+          btn.textContent = '正在批量处理…';
+          
+          try {
+            await handlePictureBatchProcessing(batchQuestions, config);
+            btn.disabled = false;
+            btn.textContent = old;
+            showToast('批量图片生成完成', 'success');
+            return;
+          } catch (error) {
+            btn.disabled = false;
+            btn.textContent = old;
+            showToast('批量处理失败: ' + error.message, 'error');
+            return;
+          }
+        }
+        
+        // 单次处理模式
+        const payload = {
+          input: document.getElementById('pic_input').value,
+          model: document.getElementById('pic_model').value || null,
+          size: document.getElementById('pic_size').value || null,
+          sequential: "auto",
+          max_images: 1,
+          watermark: document.getElementById('pic_watermark').value === 'true',
+          response_format: document.getElementById('pic_response_format').value,
+          run_count: parseInt(document.getElementById('pic_run_count').value || '1', 10),
+          input_mode: inputMode,
+        };
+        
+        // 文生图和图生图都支持优化模式
+        payload.optimize_mode = document.getElementById('pic_optimize_mode').value;
+        // 如果是图生图模式，添加参考图片ID
+        if (inputMode === 'image_to_image' && uploadedImageIds.length > 0) {
+          payload.uploaded_image_ids = uploadedImageIds;
+        }
+        btn.disabled = true; const old = btn.textContent; btn.textContent = '正在处理…';
+        const startTime = Date.now(); // 记录请求开始时间
+        const { ok, data } = await postJSON('/api/picture_generate', payload);
+        const endTime = Date.now(); // 记录请求结束时间
+        const processingTime = ((endTime - startTime) / 1000).toFixed(2); // 计算耗时（秒）
+        btn.disabled = false; btn.textContent = old; showToast('处理完成', 'success');
+        const picOutput = document.getElementById('pic_output');
+        if (ok) {
+          // 处理并发结果
+          let resultHTML = '';
+          
+          // 检查是否是并发结果格式（包含results数组）
+          if (data.results && Array.isArray(data.results)) {
+            // 并发结果格式：显示每个并发请求的结果
+            let totalImageIndex = 0; // 全局图片索引，确保图片编号连续
+            data.results.forEach((result, resultIndex) => {
+              let imagesHTML = '';
+              let metaHTML = '<div class="result-meta" style="margin-top: -8px;">';
+              
+              // 显示图片信息
+              if (result.data && result.data.length > 0) {
+                imagesHTML += '<div class="result-main" style="margin-bottom: 0;">';
+                
+                result.data.forEach((image, imageIndex) => {
+                  const isLastImage = imageIndex === result.data.length - 1;
+                  const marginBottomStyle = isLastImage ? '' : 'margin-bottom: 20px;';
+                  
+                  if (image.url) {
+                    const url = new URL(image.url);
+                    const fileName = url.pathname.split('/').pop();
+                    const imageId = fileName.split('_')[0];
+                    
+                    imagesHTML += `<div style="${marginBottomStyle}">
+                                    <h4 style="margin-top: 0;">图片${totalImageIndex + 1}</h4>
+                                    <img src="${image.url}" alt="生成的图片 ${totalImageIndex + 1}" style="max-width: 100%; max-height: 400px; margin: 10px 0;">
+                                  </div>`;
+                  } else if (image.b64_json) {
+                    imagesHTML += `<div style="${marginBottomStyle}">
+                                    <h4 style="margin-top: 0;">图片${totalImageIndex + 1}</h4>
+                                    <img src="data:image/png;base64,${image.b64_json}" alt="生成的图片 ${totalImageIndex + 1}" style="max-width: 100%; max-height: 400px; margin: 10px 0;">
+                                  </div>`;
+                  }
+                  totalImageIndex++; // 递增全局图片索引
+                });
+                imagesHTML += '</div>';
+              }
+              
+              // 显示每个结果的元信息（合并所有信息到一行）
+              if (result.data && result.data.length > 0) {
+                const image = result.data[0]; // 取第一张图片的信息
+                if (image.url) {
+                  const url = new URL(image.url);
+                  const fileName = url.pathname.split('/').pop();
+                  const imageId = fileName.split('_')[0];
+                  metaHTML += `<span class="meta-pill">尺寸: ${image.size || 'N/A'}</span>`;
+                  metaHTML += `<span class="meta-pill">ID: ${imageId}</span>`;
+                } else if (image.b64_json) {
+                  metaHTML += `<span class="meta-pill">尺寸: ${image.size || 'N/A'}</span>`;
+                }
+              }
+              metaHTML += `<span class="meta-pill">模型: ${result.model || 'N/A'}</span>`;
+              metaHTML += `<span class="meta-pill">耗时: ${result.generation_time || processingTime}秒</span>`;
+              if (result.usage) {
+                const usage = result.usage;
+                metaHTML += `<span class="meta-pill">输出Token: ${usage.output_tokens || 'N/A'}</span>`;
+                metaHTML += `<span class="meta-pill">总Token: ${usage.total_tokens || 'N/A'}</span>`;
+              }
+              metaHTML += '</div>';
+              
+              resultHTML += `<div class="result-card">
+                              ${imagesHTML}
+                              ${metaHTML}
+                            </div>`;
+            });
+          } else {
+            // 单次请求格式（向后兼容）
+            let imagesHTML = '';
+            let metaHTML = '<div class="result-meta" style="margin-top: -8px;">';
+            
+            if (data.data && data.data.length > 0) {
+              imagesHTML += '<div class="result-main" style="margin-bottom: 0;">';
+              data.data.forEach((image, index) => {
+                const isLastImage = index === data.data.length - 1;
+                const marginBottomStyle = isLastImage ? '' : 'margin-bottom: 20px;';
+                
+                if (image.url) {
+                  const url = new URL(image.url);
+                  const fileName = url.pathname.split('/').pop();
+                  const imageId = fileName.split('_')[0];
+                  
+                  imagesHTML += `<div style="${marginBottomStyle}">
+                                  <img src="${image.url}" alt="生成的图片 ${index + 1}" style="max-width: 100%; max-height: 400px; margin: 10px 0;">
+                                </div>`;
+                } else if (image.b64_json) {
+                  imagesHTML += `<div style="${marginBottomStyle}">
+                                  <img src="data:image/png;base64,${image.b64_json}" alt="生成的图片 ${index + 1}" style="max-width: 100%; max-height: 400px; margin: 10px 0;">
+                                </div>`;
+                }
+              });
+              imagesHTML += '</div>';
+            }
+            
+            // 显示元信息（合并所有信息到一行）
+            if (data.data && data.data.length > 0) {
+              const image = data.data[0]; // 取第一张图片的信息
+              if (image.url) {
+                const url = new URL(image.url);
+                const fileName = url.pathname.split('/').pop();
+                const imageId = fileName.split('_')[0];
+                metaHTML += `<span class="meta-pill">尺寸: ${image.size || 'N/A'}</span>`;
+                metaHTML += `<span class="meta-pill">ID: ${imageId}</span>`;
+              } else if (image.b64_json) {
+                metaHTML += `<span class="meta-pill">尺寸: ${image.size || 'N/A'}</span>`;
+              }
+            }
+            metaHTML += `<span class="meta-pill">模型: ${data.model || 'N/A'}</span>`;
+            metaHTML += `<span class="meta-pill">耗时: ${processingTime}秒</span>`;
+            if (data.usage) {
+              const usage = data.usage;
+              metaHTML += `<span class="meta-pill">输出Token: ${usage.output_tokens || 'N/A'}</span>`;
+              metaHTML += `<span class="meta-pill">总Token: ${usage.total_tokens || 'N/A'}</span>`;
+            }
+            metaHTML += '</div>';
+            
+            resultHTML = `<div class="result-card">
+                            ${imagesHTML}
+                            ${metaHTML}
+                          </div>`;
+          }
+          
+          picOutput.innerHTML = resultHTML;
+        } else {
+          picOutput.innerHTML = `错误：
+<pre>${JSON.stringify(data, null, 2)}</pre>`;
+        }
+      });
+
+     document.getElementById('vid_submit').addEventListener('click', async (ev) => {
+        const btn = ev.currentTarget;
+        const payload = {
+          input: document.getElementById('vid_input').value,
+          api_key: document.getElementById('vid_api_key').value || null,
+          model: document.getElementById('vid_model').value || null,
+          duration: parseInt(document.getElementById('vid_duration').value || '5', 10),
+          ratio: document.getElementById('vid_ratio').value || '16:9',
+          resolution: document.getElementById('vid_resolution').value || '720p',
+          input_mode: document.getElementById('vid_input_mode').value,
+        };
+        btn.disabled = true; const old = btn.textContent; btn.textContent = '正在处理…';
+        const { ok, data } = await postJSON('/api/video_generate', payload);
+        btn.disabled = false; btn.textContent = old; showToast('处理完成', 'success');
+        document.getElementById('vid_output').textContent = ok ? JSON.stringify(data, null, 2) : `错误：\n${JSON.stringify(data, null, 2)}`;
+      });
+
+      // 即梦AI前端调用逻辑
+      document.getElementById('jimeng_submit').addEventListener('click', async (ev) => {
+        const btn = ev.currentTarget;
+        const input = document.getElementById('jimeng_input').value.trim();
+        const run_count = parseInt(document.getElementById('jimeng_run_count').value || '1', 10);
+        const sizeElement = document.getElementById('jimeng_size');
+        const size = sizeElement ? parseInt(sizeElement.value || '4194304', 10) : 4194304;
+        const widthRaw = document.getElementById('jimeng_width').value;
+        const heightRaw = document.getElementById('jimeng_height').value;
+        const width = widthRaw ? parseInt(widthRaw, 10) : null;
+        const height = heightRaw ? parseInt(heightRaw, 10) : null;
+        
+        if (!input) {
+          showToast('请输入生成描述', 'error');
+          return;
+        }
+        
+        btn.disabled = true;
+        const old = btn.textContent;
+        btn.textContent = '正在处理…';
+        
+        // 清空之前的结果
+        const resultsContainer = document.getElementById('jimeng_results');
+        const outputContainer = document.getElementById('jimeng_output');
+        resultsContainer.innerHTML = '';
+        outputContainer.style.display = 'none';
+        
+        try {
+          const payload = {
+            input: input,
+            run_count: run_count,
+            size: size
+          };
+
+          if (width !== null || height !== null) {
+            if (width === null || height === null) {
+              showToast('自定义尺寸需同时填写宽和高', 'error');
+              return;
+            }
+            if (Number.isNaN(width) || Number.isNaN(height)) {
+              showToast('自定义宽高必须为整数', 'error');
+              return;
+            }
+            if (width < 1024 || width > 4096 || height < 1024 || height > 4096) {
+              showToast('自定义宽高范围：1024~4096', 'error');
+              return;
+            }
+            const area = width * height;
+            if (area < 1048576 || area > 16777216) {
+              showToast('宽高乘积需在 1024×1024~4096×4096', 'error');
+              return;
+            }
+            payload.width = width;
+            payload.height = height;
+          }
+          
+          const response = await fetch('/api/jimeng_ai_generate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+          
+          const data = await response.json();
+          
+          if (response.ok && data.results) {
+            // 显示结果
+            data.results.forEach((result, index) => {
+              if (result.error) {
+                // 处理错误
+                const errorCard = document.createElement('div');
+                errorCard.className = 'result-card';
+                errorCard.innerHTML = `
+                  <div class="result-main">
+                    <div class="final-answer-title">结果 ${index + 1}</div>
+                    <div class="md-content" style="color: #ef4444;">${result.error}</div>
+                  </div>
+                `;
+                resultsContainer.appendChild(errorCard);
+              } else {
+                // 处理成功结果
+                const resultCard = document.createElement('div');
+                resultCard.className = 'result-card';
+                
+                let imagesHTML = '';
+                if (result.image_urls && result.image_urls.length > 0) {
+                  result.image_urls.forEach((image_url, imgIndex) => {
+                    imagesHTML += `<div style="margin-bottom: 15px;">
+                      <img src="${image_url}" alt="生成的图片 ${imgIndex + 1}" style="max-width: 100%; max-height: 400px; cursor: pointer;" onclick="openModal('${image_url}')">
+                    </div>`;
+                  });
+                } else if (result.binary_data_base64 && result.binary_data_base64.length > 0) {
+                  result.binary_data_base64.forEach((binary_data, imgIndex) => {
+                    const dataUrl = `data:image/jpeg;base64,${binary_data}`;
+                    imagesHTML += `<div style="margin-bottom: 15px;">
+                      <img src="${dataUrl}" alt="生成的图片 ${imgIndex + 1}" style="max-width: 100%; max-height: 400px; cursor: pointer;" onclick="openModal('${dataUrl}')">
+                    </div>`;
+                  });
+                }
+                
+                resultCard.innerHTML = `
+                  <div class="result-main">
+                    <div class="final-answer-title">结果 ${index + 1}</div>
+                    ${imagesHTML}
+                  </div>
+                  <div class="result-meta">
+                    <span class="meta-pill">Task ID: ${result.task_id}</span>
+                    <span class="meta-pill">Status: ${result.status}</span>
+                    <span class="meta-pill">Request ID: ${result.request_id}</span>
+                    <span class="meta-pill">耗时: ${result.generation_time || 0}秒</span>
+                  </div>
+                `;
+                resultsContainer.appendChild(resultCard);
+              }
+            });
+            
+            showToast(`即梦AI处理完成，共生成 ${data.results.length} 个结果`, 'success');
+          } else {
+            // 处理API错误
+            outputContainer.style.display = 'block';
+            outputContainer.textContent = `错误：\n${JSON.stringify(data, null, 2)}`;
+            showToast('即梦AI调用失败', 'error');
+          }
+        } catch (error) {
+          outputContainer.style.display = 'block';
+          outputContainer.textContent = `请求失败：${error.message}`;
+          showToast('请求失败', 'error');
+        } finally {
+          btn.disabled = false;
+          btn.textContent = old;
+        }
+      });
+
+      // 图片放大和缩放功能
+      // 创建模态框
+      const modal = document.createElement('div');
+      modal.style.cssText = `
+        display: none;
+        position: fixed;
+        z-index: 10000;
+        left: 0;
+        top: 0;
+        width: 100%;
+        height: 100%;
+        overflow: auto;
+        background-color: rgb(0,0,0);
+        background-color: rgba(0,0,0,0.9);
+      `;
+      document.body.appendChild(modal);
+
+      // 创建模态框内容
+      const modalContent = document.createElement('div');
+      modalContent.style.cssText = `
+        margin: 5% auto;
+        display: block;
+        width: 80%;
+        max-width: 1200px;
+        position: relative;
+      `;
+      modal.appendChild(modalContent);
+
+      // 创建关闭按钮
+      const closeBtn = document.createElement('span');
+      closeBtn.style.cssText = `
+        position: absolute;
+        top: -10px;
+        right: 5px;
+        color: #f1f1f1;
+        font-size: 40px;
+        font-weight: bold;
+        cursor: pointer;
+        z-index: 10001;
+      `;
+      closeBtn.innerHTML = '&times;';
+      modalContent.appendChild(closeBtn);
+
+
+
+      // 创建图片元素
+      const modalImg = document.createElement('img');
+      modalImg.style.cssText = `
+        width: 100%;
+        height: auto;
+        transition: transform 0.3s ease;
+        transform-origin: center center;
+      `;
+      modalContent.appendChild(modalImg);
+
+      // 缩放比例
+      let zoomLevel = 1;
+
+      // 打开模态框
+      function openModal(src) {
+        modal.style.display = 'block';
+        modalImg.src = src;
+        zoomLevel = 1;
+        modalImg.style.transform = `scale(${zoomLevel})`;
+      }
+
+      // 关闭模态框
+      function closeModal() {
+        modal.style.display = 'none';
+        zoomLevel = 1;
+      }
+
+      // 缩放图片
+      function zoomImage(delta) {
+        if (delta < 0) {
+          // 放大
+          zoomLevel = Math.min(zoomLevel + 0.1, 5);
+        } else {
+          // 缩小
+          zoomLevel = Math.max(zoomLevel - 0.1, 0.1);
+        }
+        modalImg.style.transform = `scale(${zoomLevel})`;
+      }
+
+      // 点击图片放大特定区域
+      modalImg.addEventListener('click', (e) => {
+        const img = e.target;
+        const rect = img.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+        
+        // 设置缩放原点
+        img.style.transformOrigin = `${x}px ${y}px`;
+        
+        // 放大图片
+        zoomLevel = Math.min(zoomLevel + 0.5, 5);
+        img.style.transform = `scale(${zoomLevel})`;
+      });
+
+      // 事件监听
+      // 点击关闭按钮
+      closeBtn.addEventListener('click', closeModal);
+      // 点击模态框外部关闭
+      modal.addEventListener('click', (e) => {
+        // 检查点击是否在图片上或关闭按钮上
+        const isOnImg = e.target === modalImg;
+        const isOnClose = e.target === closeBtn;
+        
+        if (!isOnImg && !isOnClose) {
+          closeModal();
+        }
+      });
+      // ESC键关闭
+      document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && modal.style.display === 'block') {
+          closeModal();
+        }
+      });
+      // 鼠标滚轮缩放
+      modalImg.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        zoomImage(e.deltaY);
+      });
+
+
+
+      // 为所有生成的图片添加点击事件
+      // 由于图片是动态生成的，我们需要使用事件委托
+      const picOutput = document.getElementById('pic_output');
+      picOutput.addEventListener('click', (e) => {
+        if (e.target.tagName === 'IMG') {
+          openModal(e.target.src);
+        }
+      });
+
+      // 页面加载时初始化分辨率选项状态
+      document.addEventListener('DOMContentLoaded', () => {
+        const resolutionSelect = document.getElementById('vid_resolution');
+        const option1080p = resolutionSelect.querySelector('option[value="1080p"]');
+        const inputModeSelect = document.getElementById('vid_input_mode');
+        if (inputModeSelect.value === '图生视频-首帧') {
+          option1080p.disabled = true;
+          // 如果当前选中的是1080p，自动切换到720p
+          if (resolutionSelect.value === '1080p') {
+            resolutionSelect.value = '720p';
+          }
+        } else {
+          option1080p.disabled = false;
+        }
+      });
+
+      // 监听输入模式变化，显示/隐藏图片上传区域并控制分辨率选项
+      document.getElementById('vid_input_mode').addEventListener('change', (e) => {
+        const resolutionSelect = document.getElementById('vid_resolution');
+        const option1080p = resolutionSelect.querySelector('option[value="1080p"]');
+        const mode = e.target.value;
+        
+        // 参考图场景不支持1080p
+        if (mode === '图生视频-参考图') {
+          option1080p.disabled = true;
+          if (resolutionSelect.value === '1080p') {
+            resolutionSelect.value = '720p';
+          }
+        } else {
+          option1080p.disabled = false;
+        }
+        
+        const uploadSection = document.getElementById('img_upload_section');
+        if (mode !== '文生视频') {
+          uploadSection.style.display = 'block';
+        } else {
+          uploadSection.style.display = 'none';
+        }
+      });
+      
+      // 视频生成提示词输入框粘贴事件
+      document.getElementById('vid_input').addEventListener('paste', async (e) => {
+        const items = e.clipboardData.items;
+        for (const item of items) {
+          if (item.type.startsWith('image/')) {
+            const file = item.getAsFile();
+            if (!file) return;
+            
+            // 切换到图生视频-首帧模式
+            const inputModeSelect = document.getElementById('vid_input_mode');
+            inputModeSelect.value = '图生视频-首帧';
+            
+            // 显示图片上传容器
+            const uploadSection = document.getElementById('img_upload_section');
+            uploadSection.style.display = 'block';
+            
+            // 禁用1080p分辨率
+            const resolutionSelect = document.getElementById('vid_resolution');
+            const option1080p = resolutionSelect.querySelector('option[value="1080p"]');
+            option1080p.disabled = true;
+            if (resolutionSelect.value === '1080p') {
+              resolutionSelect.value = '720p';
+            }
+            
+            // 将文件设置到文件输入框
+            const fileInput = document.getElementById('vid_img_upload');
+            const dataTransfer = new DataTransfer();
+            
+            // 保留已有文件
+            if (fileInput.files) {
+               Array.from(fileInput.files).forEach(f => dataTransfer.items.add(f));
+            }
+            
+            dataTransfer.items.add(file);
+            fileInput.files = dataTransfer.files;
+            
+            // 预览图片
+            updateVidPreview(fileInput);
+            
+            showToast('图片已粘贴并添加到列表', 'success');
+            break;
+          }
+        }
+      });
+      
+      // 视频生成图片上传预览
+      document.getElementById('vid_img_upload').addEventListener('change', function(e) {
+        const files = e.target.files;
+        const previewContainer = document.getElementById('vid_preview_container');
+        
+        previewContainer.innerHTML = '';
+        
+        if (!files || files.length === 0) return;
+        
+        Array.from(files).forEach(file => {
+          const reader = new FileReader();
+          reader.onload = function(e) {
+            const previewDiv = document.createElement('div');
+            previewDiv.style.cssText = 'display: inline-block; margin: 5px; text-align: center; vertical-align: top;';
+            previewDiv.innerHTML = `
+              <img src="${e.target.result}" style="max-width: 100px; max-height: 100px; object-fit: cover; border: 1px solid #ddd; border-radius: 4px;">
+              <div style="font-size: 12px; margin-top: 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100px;">${file.name}</div>
+              <div style="font-size: 10px; color: #666;">${(file.size / 1024).toFixed(1)}KB</div>
+            `;
+            previewContainer.appendChild(previewDiv);
+          };
+          reader.readAsDataURL(file);
+        });
+      });
+
+
+
+
+
+      // 视频生成提交处理
+      document.getElementById('vid_submit').addEventListener('click', async (ev) => {
+        const btn = ev.currentTarget;
+        const input = document.getElementById('vid_input').value || '';
+        const api_key = null;
+        const model = document.getElementById('vid_model').value;
+        const duration = parseInt(document.getElementById('vid_duration').value || '5', 10);
+        const ratio = document.getElementById('vid_ratio').value || '16:9';
+        const resolution = document.getElementById('vid_resolution').value || '720p';
+        const input_mode = document.getElementById('vid_input_mode').value;
+        const run_count = parseInt(document.getElementById('vid_run_count').value || '1', 10);
+        
+        const draft = document.getElementById('vid_draft').checked;
+        const generate_audio = document.getElementById('vid_generate_audio').checked;
+        const return_last_frame = document.getElementById('vid_return_last_frame').checked;
+        
+        // 检查文本输入
+        if (!input) {
+          showToast('请输入视频描述', 'error');
+          return;
+        }
+        
+        // 检查图生视频模式下是否上传了图片
+        let image_urls = [];
+        if (input_mode !== '文生视频') {
+          const fileInput = document.getElementById('vid_img_upload');
+          if (!fileInput.files || fileInput.files.length === 0) {
+            showToast('请上传图片', 'error');
+            return;
+          }
+          
+          // 校验数量
+          if (input_mode === '图生视频-首尾帧' && fileInput.files.length < 2) {
+             showToast('首尾帧模式需要至少2张图片', 'error');
+             return;
+          }
+          
+          // 将图片转换为base64格式
+          for (const file of fileInput.files) {
+             if (file.size > 30 * 1024 * 1024) {
+                showToast(`图片 ${file.name} 大小不能超过30MB`, 'error');
+                return;
+             }
+             const base64 = await new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = (e) => resolve(e.target.result);
+                reader.onerror = reject;
+                reader.readAsDataURL(file);
+             });
+             image_urls.push(base64);
+          }
+        }
+        
+        showToast('视频生成请求已提交，正在处理…', 'success');
+        btn.disabled = true;
+        const old = btn.textContent;
+        btn.textContent = '稍等…';
+        
+        try {
+          const { ok, data } = await postJSON('/api/video_generate', {
+            input,
+            api_key,
+            model,
+            duration,
+            ratio,
+            resolution,
+            input_mode,
+            run_count,
+            image_urls,
+            draft,
+            generate_audio,
+            return_last_frame
+          });
+          
+          const output = document.getElementById('vid_output');
+          if (ok) {
+            // 处理并发结果
+            let resultHTML = '';
+            
+            // 检查是否是并发结果格式（包含results数组）
+            if (data.results && Array.isArray(data.results)) {
+              // 并发结果格式：显示每个并发请求的结果
+              let totalVideoIndex = 0; // 全局视频索引，确保视频编号连续
+              data.results.forEach((result, resultIndex) => {
+                if (result.error) {
+                  resultHTML += `<div class="result-card">
+                                  <div class="result-main">
+                                    <h3 style="color: red;">视频${totalVideoIndex + 1}生成失败</h3>
+                                    <pre style="color: red;">${JSON.stringify(result.error, null, 2)}</pre>
+                                  </div>
+                                </div>`;
+                } else {
+                  // 构建单个视频结果展示HTML
+                  const videoHTML = `
+                    <div class="result-card">
+                      <div class="result-main">
+                        <h3>生成的视频${totalVideoIndex + 1}</h3>
+                        <video controls style="max-width: 100%; max-height: 400px; margin: 10px 0;">
+                          <source src="${result.content.video_url}" type="video/mp4">
+                          您的浏览器不支持视频播放
+                        </video>
+                      </div>
+                      <div class="result-meta" style="margin-top: 8px;">
+                        <span class="meta-pill">模型: ${result.model || 'N/A'}</span>
+                        <span class="meta-pill">任务ID: ${result.task_id || result.id || 'N/A'}</span>
+                        <span class="meta-pill">Token用量: ${result.usage?.total_tokens || 0}</span>
+                        <span class="meta-pill">分辨率: ${result.resolution || 'N/A'}</span>
+                        <span class="meta-pill">视频时长: ${result.duration || 'N/A'}秒</span>
+                        <span class="meta-pill">帧率: ${result.framespersecond || 'N/A'}fps</span>
+                        <span class="meta-pill">耗时: ${result.generation_time || 'N/A'}秒</span>
+                        <span class="meta-pill">比例: ${result.ratio || 'N/A'}</span>
+                        <span class="meta-pill">种子: ${result.seed || 'N/A'}</span>
+                      </div>
+                    </div>`;
+                  resultHTML += videoHTML;
+                }
+                totalVideoIndex++;
+              });
+            } else {
+              // 单次请求格式（向后兼容）
+              const videoHTML = `
+                <div class="result-container">
+                  <div class="result-main">
+                    <h3>生成的视频</h3>
+                    <video controls style="max-width: 100%; max-height: 400px; margin: 10px 0;">
+                      <source src="${data.content.video_url}" type="video/mp4">
+                      您的浏览器不支持视频播放
+                    </video>
+                  </div>
+                  <div class="result-meta" style="margin-top: 8px;">
+                    <span class="meta-pill">模型: ${data.model || 'N/A'}</span>
+                    <span class="meta-pill">任务ID: ${data.task_id || data.id || 'N/A'}</span>
+                    <span class="meta-pill">Token用量: ${data.usage?.total_tokens || 0}</span>
+                    <span class="meta-pill">分辨率: ${data.resolution || 'N/A'}</span>
+                    <span class="meta-pill">视频时长: ${data.duration || 'N/A'}秒</span>
+                    <span class="meta-pill">帧率: ${data.framespersecond || 'N/A'}fps</span>
+                    <span class="meta-pill">耗时: ${data.generation_time || 'N/A'}秒</span>
+                    <span class="meta-pill">比例: ${data.ratio || 'N/A'}</span>
+                    <span class="meta-pill">种子: ${data.seed || 'N/A'}</span>
+                  </div>
+                </div>
+              `;
+              resultHTML = videoHTML;
+            }
+            output.innerHTML = resultHTML;
+            output.style.display = 'block';
+            showToast('视频生成成功', 'success');
+          } else {
+            output.innerHTML = `<pre style="color: red;">${JSON.stringify(data, null, 2)}</pre>`;
+            output.style.display = 'block';
+            showToast('视频生成失败', 'error');
+          }
+        } catch (err) {
+          console.error(err);
+          const output = document.getElementById('vid_output');
+          output.innerHTML = `<pre style="color: red;">请求失败: ${err.message}</pre>`;
+          output.style.display = 'block';
+          showToast('请求失败', 'error');
+        } finally {
+          btn.disabled = false;
+          btn.textContent = old;
+        }
+      });
+    </script>
+    <!-- 滚动动画效果 -->
+    <script>
+      // 滚动动画观察器
+      document.addEventListener('DOMContentLoaded', () => {
+        // 创建IntersectionObserver实例
+        const observerOptions = {
+          root: null,
+          rootMargin: '0px',
+          threshold: 0.1
+        };
+
+        const observer = new IntersectionObserver((entries) => {
+          entries.forEach(entry => {
+            if (entry.isIntersecting) {
+              entry.target.classList.add('visible');
+            }
+          });
+        }, observerOptions);
+
+        // 动态添加观察器
+        const observeNewElements = () => {
+          const sections = document.querySelectorAll('section:not(.visible)');
+          sections.forEach(section => {
+            if (!section.classList.contains('visible')) {
+              observer.observe(section);
+            }
+          });
+
+          const resultCards = document.querySelectorAll('.result-card:not(.visible), .model-result-card:not(.visible)');
+          resultCards.forEach(card => {
+            if (!card.classList.contains('visible')) {
+              observer.observe(card);
+            }
+          });
+        };
+
+        // 初始观察
+        observeNewElements();
+
+        // 定期检查新元素
+        setInterval(observeNewElements, 1000);
+      });
+    </script>
+    <!-- 粒子背景效果 -->
+    <script src="/static/particles.js"></script>
+    
+    <!-- 页脚 -->
+    <footer class="page-footer">
+      <div class="footer-bottom">
+        <p>有任何问题或建议，随时联系:juwenfeng.alex@bytedance.com </p>
+      </div>
+    </footer>
+  </body>
+  </html>

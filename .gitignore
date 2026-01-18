@@ -1,0 +1,47 @@
+# 环境变量文件
+.env
+.env.local
+.env.*.local
+env
+
+# 临时文件
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+
+# 上传的文件
+uploaded_images_*
+*.tmp
+*.temp
+
+# 日志文件
+*.log
+logs/
+
+# IDE配置
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+
+# 虚拟环境
+.venv/
+env/
+venv/
+ENV/
+
+# 测试覆盖报告
+htmlcov/
+.pytest_cache/
+.coverage
+
+# 构建产物
+dist/
+build/
+*.egg-info/
