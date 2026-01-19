@@ -3864,36 +3864,26 @@ ${JSON.stringify(data, null, 2)}`;
         const resolutionSelect = document.getElementById('vid_resolution');
         const option1080p = resolutionSelect.querySelector('option[value="1080p"]');
         const inputModeSelect = document.getElementById('vid_input_mode');
-        if (inputModeSelect.value === '图生视频-首帧') {
-          option1080p.disabled = true;
-          // 如果当前选中的是1080p，自动切换到720p
-          if (resolutionSelect.value === '1080p') {
-            resolutionSelect.value = '720p';
-          }
-        } else {
-          option1080p.disabled = false;
-        }
+        
+        // 解除1080p限制
+        option1080p.disabled = false;
       });
 
       // 监听输入模式变化，显示/隐藏图片上传区域并控制分辨率选项
       document.getElementById('vid_input_mode').addEventListener('change', (e) => {
         const resolutionSelect = document.getElementById('vid_resolution');
         const option1080p = resolutionSelect.querySelector('option[value="1080p"]');
+        const ratioSelect = document.getElementById('vid_ratio');
         const mode = e.target.value;
         
-        // 参考图场景不支持1080p
-        if (mode === '图生视频-参考图') {
-          option1080p.disabled = true;
-          if (resolutionSelect.value === '1080p') {
-            resolutionSelect.value = '720p';
-          }
-        } else {
-          option1080p.disabled = false;
-        }
+        // 解除1080p限制，所有模式都支持
+        option1080p.disabled = false;
         
         const uploadSection = document.getElementById('img_upload_section');
         if (mode !== '文生视频') {
           uploadSection.style.display = 'block';
+          // 图生视频自动切换ratio为adaptive
+          ratioSelect.value = 'adaptive';
         } else {
           uploadSection.style.display = 'none';
         }
@@ -3915,13 +3905,14 @@ ${JSON.stringify(data, null, 2)}`;
             const uploadSection = document.getElementById('img_upload_section');
             uploadSection.style.display = 'block';
             
-            // 禁用1080p分辨率
+            // 解除1080p限制
             const resolutionSelect = document.getElementById('vid_resolution');
             const option1080p = resolutionSelect.querySelector('option[value="1080p"]');
-            option1080p.disabled = true;
-            if (resolutionSelect.value === '1080p') {
-              resolutionSelect.value = '720p';
-            }
+            option1080p.disabled = false;
+
+            // 图生视频自动切换ratio为adaptive
+            const ratioSelect = document.getElementById('vid_ratio');
+            ratioSelect.value = 'adaptive';
             
             // 将文件设置到文件输入框
             const fileInput = document.getElementById('vid_img_upload');
