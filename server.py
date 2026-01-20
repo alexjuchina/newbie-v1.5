@@ -483,6 +483,31 @@ async def upload_image(file: UploadFile = File(...)):
         return JSONResponse({"error": f"图片上传失败: {str(e)}"}, status_code=500)
 
 
+@app.post("/api/delete_image")
+async def delete_image(image_id: str = Form(...)):
+    """Delete uploaded image by image_id"""
+    try:
+        if image_id not in UPLOADED_IMAGES:
+            return JSONResponse({"error": "图片不存在"}, status_code=404)
+        
+        image_info = UPLOADED_IMAGES[image_id]
+        file_path = image_info['file_path']
+        
+        # Delete the file from disk
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        
+        # Remove from memory
+        del UPLOADED_IMAGES[image_id]
+        
+        return {
+            "success": True,
+            "message": "图片删除成功"
+        }
+    except Exception as e:
+        return JSONResponse({"error": f"图片删除失败: {str(e)}"}, status_code=500)
+
+
 @app.post("/api/ep_chat")
 def ep_chat(payload: EPChatPayload):
     # Existing endpoint - same as before, for backward compatibility

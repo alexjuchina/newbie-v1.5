@@ -937,13 +937,15 @@
         container.innerHTML = '';
         if (!input.files || input.files.length === 0) return;
         
-        Array.from(input.files).forEach(file => {
+        Array.from(input.files).forEach((file, index) => {
           const reader = new FileReader();
           reader.onload = (e) => {
             const previewDiv = document.createElement('div');
-            previewDiv.style.cssText = 'display: inline-block; margin: 5px; text-align: center; vertical-align: top;';
+            previewDiv.id = `vid_preview_${index}`;
+            previewDiv.style.cssText = 'display: inline-block; margin: 5px; text-align: center; vertical-align: top; position: relative;';
             previewDiv.innerHTML = `
               <img src="${e.target.result}" style="max-width: 100px; max-height: 100px; object-fit: cover; border: 1px solid #ddd; border-radius: 4px;">
+              <button onclick="deleteVidImage(${index})" style="position: absolute; top: -5px; right: -5px; background: #ef4444; color: white; border: none; border-radius: 50%; width: 20px; height: 20px; cursor: pointer; font-size: 14px; line-height: 1; padding: 0;">×</button>
               <div style="font-size: 12px; margin-top: 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100px;">${file.name}</div>
               <div style="font-size: 10px; color: #666;">${(file.size / 1024).toFixed(1)}KB</div>
             `;
@@ -951,6 +953,66 @@
           };
           reader.readAsDataURL(file);
         });
+      }
+
+      function deleteEpImage() {
+        const imageInput = document.getElementById('ep_image');
+        const existingPreview = document.getElementById('ep_image_preview');
+        
+        if (existingPreview) {
+          existingPreview.remove();
+        }
+        
+        if (imageInput) {
+          imageInput.value = '';
+        }
+      }
+
+      function deletePicImage(imageId) {
+        const formData = new FormData();
+        formData.append('image_id', imageId);
+        
+        fetch('/api/delete_image', {
+          method: 'POST',
+          body: formData
+        })
+        .then(response => response.json())
+        .then(data => {
+          if (data.success) {
+            showToast('图片删除成功', 'success');
+            const previewContainer = document.getElementById('pic_preview_container');
+            const previewDiv = document.getElementById(`pic_preview_${imageId}`);
+            if (previewDiv) {
+              previewDiv.remove();
+            }
+            uploadedImageIds = uploadedImageIds.filter(id => id !== imageId);
+          } else {
+            showToast('图片删除失败: ' + data.error, 'error');
+          }
+        })
+        .catch(error => {
+          showToast('图片删除失败: ' + error.message, 'error');
+        });
+      }
+
+      function deleteVidImage(index) {
+        const fileInput = document.getElementById('vid_img_upload');
+        const previewContainer = document.getElementById('vid_preview_container');
+        
+        if (fileInput.files && fileInput.files[index]) {
+          const dataTransfer = new DataTransfer();
+          for (let i = 0; i < fileInput.files.length; i++) {
+            if (i !== index) {
+              dataTransfer.items.add(fileInput.files[i]);
+            }
+          }
+          fileInput.files = dataTransfer.files;
+        }
+        
+        const previewDiv = document.getElementById(`vid_preview_${index}`);
+        if (previewDiv) {
+          previewDiv.remove();
+        }
       }
       
       // 文件选择预览事件
@@ -1026,6 +1088,41 @@
         if (downloadBtn) {
           downloadBtn.addEventListener('click', () => {
             // EP推理下载功能已定义
+          });
+        }
+
+        // EP推理图片上传预览
+        const epImageInput = document.getElementById('ep_image');
+        if (epImageInput) {
+          epImageInput.addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+            
+            const reader = new FileReader();
+            reader.onload = function(ev) {
+              // 移除旧的预览
+              const existingPreview = document.getElementById('ep_image_preview');
+              if (existingPreview) {
+                existingPreview.remove();
+              }
+              
+              // 创建新的预览
+              const previewDiv = document.createElement('div');
+              previewDiv.id = 'ep_image_preview';
+              previewDiv.style.cssText = 'margin-top: 10px; margin-bottom: 10px;';
+              previewDiv.innerHTML = `
+                <div style="display: inline-block; margin: 5px; text-align: center; position: relative;">
+                  <img src="${ev.target.result}" style="max-width: 200px; max-height: 200px; object-fit: cover; border: 1px solid #ddd; border-radius: 4px;">
+                  <button onclick="deleteEpImage()" style="position: absolute; top: -5px; right: -5px; background: #ef4444; color: white; border: none; border-radius: 50%; width: 24px; height: 24px; cursor: pointer; font-size: 16px; line-height: 1; padding: 0;">×</button>
+                  <div style="font-size: 12px; margin-top: 5px;">${file.name}</div>
+                  <div style="font-size: 10px; color: #666;">${(file.size / 1024).toFixed(1)}KB</div>
+                </div>
+              `;
+              
+              // 将预览添加到文件输入框下方
+              epImageInput.parentNode.insertBefore(previewDiv, epImageInput.nextSibling);
+            };
+            reader.readAsDataURL(file);
           });
         }
         
@@ -1883,8 +1980,9 @@
               previewDiv.id = 'ep_image_preview';
               previewDiv.style.cssText = 'margin-top: 10px; margin-bottom: 10px;';
               previewDiv.innerHTML = `
-                <div style="display: inline-block; margin: 5px; text-align: center;">
+                <div style="display: inline-block; margin: 5px; text-align: center; position: relative;">
                   <img src="${ev.target.result}" style="max-width: 200px; max-height: 200px; object-fit: cover; border: 1px solid #ddd; border-radius: 4px;">
+                  <button onclick="deleteEpImage()" style="position: absolute; top: -5px; right: -5px; background: #ef4444; color: white; border: none; border-radius: 50%; width: 24px; height: 24px; cursor: pointer; font-size: 16px; line-height: 1; padding: 0;">×</button>
                   <div style="font-size: 12px; margin-top: 5px;">粘贴的图片</div>
                   <div style="font-size: 10px; color: #666;">${(file.size / 1024).toFixed(1)}KB</div>
                 </div>
@@ -3158,9 +3256,11 @@ ${JSON.stringify(data, null, 2)}`;
             const reader = new FileReader();
             reader.onload = function(ev) {
               const previewDiv = document.createElement('div');
-              previewDiv.style.cssText = 'display: inline-block; margin: 5px; text-align: center;';
+              previewDiv.id = `pic_preview_temp`;
+              previewDiv.style.cssText = 'display: inline-block; margin: 5px; text-align: center; position: relative;';
               previewDiv.innerHTML = `
                 <img src="${ev.target.result}" style="max-width: 100px; max-height: 100px; object-fit: cover; border: 1px solid #ddd; border-radius: 4px;">
+                <button onclick="deletePicImage('${uploadedImageIds[0] || ''}')" style="position: absolute; top: -5px; right: -5px; background: #ef4444; color: white; border: none; border-radius: 50%; width: 20px; height: 20px; cursor: pointer; font-size: 14px; line-height: 1; padding: 0;">×</button>
                 <div style="font-size: 12px; margin-top: 5px;">粘贴的图片</div>
                 <div style="font-size: 10px; color: #666;">${(file.size / 1024).toFixed(1)}KB</div>
               `;
@@ -3182,6 +3282,15 @@ ${JSON.stringify(data, null, 2)}`;
                 const result = await response.json();
                 uploadedImageIds.push(result.image_id);
                 showToast('图片粘贴并上传成功', 'success');
+                // 更新删除按钮的onclick事件和预览div的ID
+                const previewDiv = previewContainer.querySelector('#pic_preview_temp');
+                if (previewDiv) {
+                  previewDiv.id = `pic_preview_${result.image_id}`;
+                  const deleteBtn = previewDiv.querySelector('button');
+                  if (deleteBtn) {
+                    deleteBtn.setAttribute('onclick', `deletePicImage('${result.image_id}')`);
+                  }
+                }
               } else {
                 const error = await response.json();
                 showToast('图片上传失败: ' + error.error, 'error');
@@ -3225,9 +3334,11 @@ ${JSON.stringify(data, null, 2)}`;
           const reader = new FileReader();
           reader.onload = function(ev) {
             const previewDiv = document.createElement('div');
-            previewDiv.style.cssText = 'display: inline-block; margin: 5px; text-align: center;';
+            previewDiv.id = `pic_preview_temp_${i}`;
+            previewDiv.style.cssText = 'display: inline-block; margin: 5px; text-align: center; position: relative;';
             previewDiv.innerHTML = `
               <img src="${ev.target.result}" style="max-width: 100px; max-height: 100px; object-fit: cover; border: 1px solid #ddd; border-radius: 4px;">
+              <button onclick="deletePicImage('temp_${i}')" style="position: absolute; top: -5px; right: -5px; background: #ef4444; color: white; border: none; border-radius: 50%; width: 20px; height: 20px; cursor: pointer; font-size: 14px; line-height: 1; padding: 0;">×</button>
               <div style="font-size: 12px; margin-top: 5px;">${file.name}</div>
               <div style="font-size: 10px; color: #666;">${(file.size / 1024).toFixed(1)}KB</div>
             `;
@@ -3249,6 +3360,15 @@ ${JSON.stringify(data, null, 2)}`;
               const result = await response.json();
               uploadedImageIds.push(result.image_id);
               showToast(`图片 ${file.name} 上传成功`, 'success');
+              // 更新删除按钮的onclick事件和预览div的ID
+              const previewDiv = document.getElementById(`pic_preview_temp_${i}`);
+              if (previewDiv) {
+                previewDiv.id = `pic_preview_${result.image_id}`;
+                const deleteBtn = previewDiv.querySelector('button');
+                if (deleteBtn) {
+                  deleteBtn.setAttribute('onclick', `deletePicImage('${result.image_id}')`);
+                }
+              }
             } else {
               const error = await response.json();
               showToast(`图片 ${file.name} 上传失败: ${error.detail}`, 'error');
@@ -3937,27 +4057,7 @@ ${JSON.stringify(data, null, 2)}`;
       
       // 视频生成图片上传预览
       document.getElementById('vid_img_upload').addEventListener('change', function(e) {
-        const files = e.target.files;
-        const previewContainer = document.getElementById('vid_preview_container');
-        
-        previewContainer.innerHTML = '';
-        
-        if (!files || files.length === 0) return;
-        
-        Array.from(files).forEach(file => {
-          const reader = new FileReader();
-          reader.onload = function(e) {
-            const previewDiv = document.createElement('div');
-            previewDiv.style.cssText = 'display: inline-block; margin: 5px; text-align: center; vertical-align: top;';
-            previewDiv.innerHTML = `
-              <img src="${e.target.result}" style="max-width: 100px; max-height: 100px; object-fit: cover; border: 1px solid #ddd; border-radius: 4px;">
-              <div style="font-size: 12px; margin-top: 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100px;">${file.name}</div>
-              <div style="font-size: 10px; color: #666;">${(file.size / 1024).toFixed(1)}KB</div>
-            `;
-            previewContainer.appendChild(previewDiv);
-          };
-          reader.readAsDataURL(file);
-        });
+        updateVidPreview(e.target);
       });
 
 
